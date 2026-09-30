@@ -1,15 +1,13 @@
 use crate::lexer::{Semantic, SemanticToken, Token, dummy};
-use crate::{Span, Spanned, get_source_len_from_tokens};
+use crate::{Span, Spanned, format_unexpected_token_error};
 use std::borrow::Cow;
 use std::convert::Into;
-use std::fmt::{Display, Formatter};
-use std::mem::discriminant;
 
 #[derive(Debug)]
 pub enum Error {
     UnexpectedToken {
-        expected: &'static Token,
-        actual: &'static Token,
+        unexpected: &'static Token,
+        expected: Vec<&'static Token>,
     },
     UnexpectedEos,
     UnknownInstruction {
@@ -21,17 +19,22 @@ pub enum Error {
     InvalidLiteral,
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl Error {
+    fn unexpected_token(unexpected: &'static Token, expected: Vec<&'static Token>) -> Self {
+        Error::UnexpectedToken {
+            unexpected,
+            expected,
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::UnexpectedToken { expected, actual } => {
-                write!(
-                    f,
-                    "Unexpected token {}, expected {}",
-                    actual.tag(),
-                    expected.tag()
-                )
-            }
+            Error::UnexpectedToken {
+                unexpected,
+                expected,
+            } => format_unexpected_token_error(f, unexpected, expected),
             Error::UnexpectedEos => {
                 write!(f, "Unexpected EOS")
             }
@@ -258,95 +261,90 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn expect_token(&mut self, token: &Token) -> Option<&Spanned<SemanticToken>> {
-        if let Some(spanned) = self.tokens.get(self.offset) {
-            if discriminant(spanned.inner().inner()) == discriminant(token) {
-                self.offset += 1;
-                return Some(spanned);
-            }
-        }
-
-        None
-    }
-
-    fn consume_token(
+    fn expect_this(
         &mut self,
         token: &'static Token,
-    ) -> Result<&Spanned<SemanticToken>, Spanned<Error>> {
-        if let Some(spanned) = self.tokens.get(self.offset) {
-            let t = spanned.inner().inner();
-            if discriminant(t) == discriminant(token) {
-                self.offset += 1;
-                return Ok(spanned);
-            }
-
-            return Err(Spanned::new(
-                Error::UnexpectedToken {
-                    expected: token,
-                    actual: t.to_dummy(),
-                },
-                spanned.span.clone(),
-            ));
-        }
-
-        Err(Spanned::new(
-            Error::UnexpectedEos,
-            Span::new(self.source_len, 0),
-        ))
-    }
-
-    fn expect_name(&mut self, expected_semantic: Option<Semantic>) -> Option<Spanned<String>> {
+        semantic: Option<Semantic>,
+    ) -> Option<Spanned<&'t Token>> {
         if let Some(Spanned {
             value:
                 SemanticToken {
-                    value: token,
-                    semantic,
+                    value: t,
+                    semantic: s,
                 },
             span,
         }) = self.tokens.get(self.offset).map(|c| c.as_ref())
         {
-            if let Token::Name(name) = token {
-                semantic.set(expected_semantic);
+            if std::mem::discriminant(t) == std::mem::discriminant(token) {
+                if let Some(semantic) = semantic {
+                    s.set(Some(semantic))
+                }
                 self.offset += 1;
-                return Some(Spanned::new(name.clone(), span.to_owned()));
+                return Some(Spanned::new(t, span.to_owned()));
             }
         }
 
         None
+    }
+
+    fn consume_any(
+        &mut self,
+        targets: &[(&'static Token, Option<Semantic>)],
+    ) -> Result<Spanned<&'t Token>, Spanned<Error>> {
+        if let Some(Spanned {
+            value:
+                SemanticToken {
+                    value: t,
+                    semantic: s,
+                },
+            span,
+        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
+        {
+            let span = span.to_owned();
+            if let Some(target) = targets
+                .iter()
+                .find(|target| std::mem::discriminant(t) == std::mem::discriminant((**target).0))
+            {
+                if let Some(semantic) = (*target).1 {
+                    s.set(Some(semantic))
+                }
+                self.offset += 1;
+                Ok(Spanned::new(t, span))
+            } else {
+                Err(Spanned::new(
+                    Error::UnexpectedToken {
+                        unexpected: t.to_dummy(),
+                        expected: targets.iter().map(|(t, _)| *t).collect(),
+                    },
+                    span,
+                ))
+            }
+        } else {
+            Err(Spanned::new(
+                Error::UnexpectedEos,
+                Span::new(self.source_len, 0),
+            ))
+        }
+    }
+
+    fn consume_this(
+        &mut self,
+        token: &'static Token,
+        semantic: Option<Semantic>,
+    ) -> Result<Spanned<&'t Token>, Spanned<Error>> {
+        self.consume_any(&[(token, semantic)])
     }
 
     fn consume_name(
         &mut self,
-        consumed_semantic: Option<Semantic>,
+        semantic: Option<Semantic>,
     ) -> Result<Spanned<String>, Spanned<Error>> {
-        if let Some(Spanned {
-            value:
-                SemanticToken {
-                    value: token,
-                    semantic,
-                },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if let Token::Name(name) = token {
-                semantic.set(consumed_semantic);
-                self.offset += 1;
-                return Ok(Spanned::new(name.to_owned(), span.to_owned()));
+        Ok(self.consume_this(&dummy::NAME, semantic)?.map(|t| unsafe {
+            match t {
+                Token::Name(name) => name.to_owned(),
+                _ => std::hint::unreachable_unchecked(),
             }
-
-            return Err(Spanned::new(
-                Error::UnexpectedToken {
-                    expected: &dummy::NAME,
-                    actual: token.to_dummy(),
-                },
-                span.clone(),
-            ));
-        }
-
-        Err(Spanned::new(
-            Error::UnexpectedEos,
-            Span::new(self.source_len, 0),
-        ))
+        }))
     }
 
     fn expect_mnemonic(&mut self) -> Option<(Spanned<String>, &SemanticToken)> {
@@ -396,21 +394,6 @@ impl<'t> Parser<'t> {
         None
     }
 
-    fn expect_integer(&mut self) -> Option<Spanned<usize>> {
-        if let Some(Spanned {
-            value: SemanticToken { value: token, .. },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if let Token::Integer(value) = token {
-                self.offset += 1;
-                return Some(Spanned::new(*value, span.to_owned()));
-            }
-        }
-
-        None
-    }
-
     fn consume_integer(&mut self) -> Result<Spanned<usize>, Spanned<Error>> {
         if let Some(Spanned {
             value: SemanticToken { value: token, .. },
@@ -423,10 +406,7 @@ impl<'t> Parser<'t> {
             }
 
             return Err(Spanned::new(
-                Error::UnexpectedToken {
-                    expected: &dummy::INTEGER,
-                    actual: token.to_dummy(),
-                },
+                Error::unexpected_token(&dummy::INTEGER, vec![token.to_dummy()]),
                 span.clone(),
             ));
         }
@@ -459,10 +439,7 @@ impl<'t> Parser<'t> {
             }
 
             return Err(Spanned::new(
-                Error::UnexpectedToken {
-                    expected: &dummy::NAME,
-                    actual: token.to_dummy(),
-                },
+                Error::unexpected_token(&dummy::NAME, vec![token.to_dummy()]),
                 span.clone(),
             ));
         }
@@ -476,11 +453,11 @@ impl<'t> Parser<'t> {
     fn parse_format_a(&mut self) -> Result<Spanned<FormatA>, Spanned<Error>> {
         let rd = self.consume_gp_register()?;
 
-        self.consume_token(&dummy::COMMA)?;
+        self.consume_this(&dummy::COMMA, None)?;
 
         let rs1 = self.consume_gp_register()?;
 
-        self.consume_token(&dummy::COMMA)?;
+        self.consume_this(&dummy::COMMA, None)?;
 
         let rs2 = self.consume_gp_register()?;
 
@@ -512,10 +489,10 @@ impl<'t> Parser<'t> {
     ) -> Result<Spanned<BoundedWord<N>>, Spanned<Error>> {
         let negative;
         let sign_span;
-        if let Some(t) = self.expect_token(&dummy::PLUS) {
+        if let Some(t) = self.expect_this(&dummy::PLUS, None) {
             negative = false;
             sign_span = Some(t.span.to_owned());
-        } else if let Some(t) = self.expect_token(&dummy::MINUS) {
+        } else if let Some(t) = self.expect_this(&dummy::MINUS, None) {
             negative = true;
             sign_span = Some(t.span.to_owned());
         } else {
@@ -540,7 +517,7 @@ impl<'t> Parser<'t> {
     fn parse_format_e(&mut self) -> Result<Spanned<FormatE>, Spanned<Error>> {
         let rd = self.consume_gp_register()?;
 
-        self.consume_token(&dummy::COMMA)?;
+        self.consume_this(&dummy::COMMA, None)?;
 
         let imm = self.parse_possibly_signed_integer::<9>()?;
 
@@ -560,18 +537,21 @@ impl<'t> Parser<'t> {
             span: start_span,
         } = self.consume_gp_register()?;
 
-        self.consume_token(&dummy::COMMA)?;
+        self.consume_this(&dummy::COMMA, None)?;
 
-        self.consume_token(&dummy::LEFT_BRACKET)?;
+        self.consume_this(&dummy::LEFT_BRACKET, None)?;
 
         let rs = self.consume_gp_register()?.value;
 
-        let (off, end_span) = match self.expect_token(&dummy::RIGHT_BRACKET) {
+        let (off, end_span) = match self.expect_this(&dummy::RIGHT_BRACKET, None) {
             Some(t) => (BoundedWord::new_truncated(0), t.span.to_owned()),
             None => {
                 let off = self.parse_possibly_signed_integer::<5>()?.into_inner();
 
-                let span = self.consume_token(&dummy::RIGHT_BRACKET)?.span.to_owned();
+                let span = self
+                    .consume_this(&dummy::RIGHT_BRACKET, None)?
+                    .span
+                    .to_owned();
 
                 (off, span)
             }
@@ -584,22 +564,25 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_format_f_st(&mut self) -> Result<Spanned<FormatF>, Spanned<Error>> {
-        let start_span = self.consume_token(&dummy::LEFT_BRACKET)?.span.to_owned();
+        let start_span = self
+            .consume_this(&dummy::LEFT_BRACKET, None)?
+            .span
+            .to_owned();
 
         let rd = self.consume_gp_register()?.value;
 
-        let off = match self.expect_token(&dummy::RIGHT_BRACKET) {
+        let off = match self.expect_this(&dummy::RIGHT_BRACKET, None) {
             Some(_) => BoundedWord::new_truncated(0),
             None => {
                 let off = self.parse_possibly_signed_integer::<5>()?.into_inner();
 
-                self.consume_token(&dummy::RIGHT_BRACKET)?;
+                self.consume_this(&dummy::RIGHT_BRACKET, None)?;
 
                 off
             }
         };
 
-        self.consume_token(&dummy::COMMA)?;
+        self.consume_this(&dummy::COMMA, None)?;
 
         let Spanned {
             value: rs,
@@ -618,7 +601,7 @@ impl<'t> Parser<'t> {
         let rd = self.consume_gp_register()?;
         let rd_value = rd.value.clone();
 
-        self.consume_token(&dummy::COMMA)?;
+        self.consume_this(&dummy::COMMA, None)?;
 
         let imm = self.parse_possibly_signed_integer::<16>()?;
 

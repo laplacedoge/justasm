@@ -1,4 +1,4 @@
-use crate::lexer::SemanticToken;
+use crate::lexer::{SemanticToken, Token};
 
 pub mod assembler;
 pub mod lexer;
@@ -67,5 +67,33 @@ pub fn get_source_len_from_tokens(tokens: &[Spanned<SemanticToken>]) -> usize {
     } else {
         let Spanned { span, .. } = unsafe { tokens.get_unchecked(num_tokens - 1) };
         span.offset + span.length
+    }
+}
+
+pub fn format_unexpected_token_error(
+    f: &mut std::fmt::Formatter,
+    unexpected: &'static Token,
+    expected: &[&'static Token],
+) -> std::fmt::Result {
+    let count = expected.len();
+    match count {
+        0 => write!(f, "Unexpected token {}", unexpected.tag()),
+        1 => write!(
+            f,
+            "Unexpected token {}, expected {}",
+            unexpected.tag(),
+            unsafe { expected.get_unchecked(0).tag() },
+        ),
+        _ => write!(
+            f,
+            "Unexpected token {}, expected {} or {}",
+            unexpected.tag(),
+            expected[0..count - 1]
+                .iter()
+                .map(|t| t.tag())
+                .collect::<Vec<&'static str>>()
+                .join(", "),
+            unsafe { expected.get_unchecked(count - 1).tag() },
+        ),
     }
 }

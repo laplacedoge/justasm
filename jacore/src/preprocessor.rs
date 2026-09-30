@@ -1,9 +1,8 @@
 use crate::lexer::{Semantic, SemanticToken, Token, dummy};
-use crate::{Span, Spanned, get_source_len_from_tokens};
+use crate::{Span, Spanned, format_unexpected_token_error, get_source_len_from_tokens};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Formatter;
-use std::ops::Deref;
 
 #[derive(Debug)]
 pub enum Error {
@@ -23,29 +22,7 @@ impl std::fmt::Display for Error {
             Error::UnexpectedToken {
                 unexpected,
                 expected,
-            } => {
-                let count = expected.len();
-                match count {
-                    0 => write!(f, "Unexpected token {}", unexpected.tag()),
-                    1 => write!(
-                        f,
-                        "Unexpected token {}, expected {}",
-                        unexpected.tag(),
-                        unsafe { expected.get_unchecked(0).tag() },
-                    ),
-                    _ => write!(
-                        f,
-                        "Unexpected token {}, expected {} or {}",
-                        unexpected.tag(),
-                        expected[0..count - 1]
-                            .iter()
-                            .map(|t| t.tag())
-                            .collect::<Vec<&'static str>>()
-                            .join(", "),
-                        unsafe { expected.get_unchecked(count - 1).tag() },
-                    ),
-                }
-            }
+            } => format_unexpected_token_error(f, unexpected, expected),
             Error::UnknownDirective { name } => write!(f, "Unknown directive '{}'", name),
             Error::UnexpectedEos => write!(f, "Unexpected EOS"),
         }
