@@ -1,0 +1,12 @@
+[package]
+name = "jaa"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+clap-verbosity-flag = "3.0.4"
+log = "0.4.34"
+env_logger = "0.11.11"
+chrono = "0.4.45"
+jacore = { path = "../jacore" }

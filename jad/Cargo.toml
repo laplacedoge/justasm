@@ -1,0 +1,10 @@
+[package]
+name = "jad"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jacore = { path = "../jacore" }
+tokio = { version = "1.53.1", features = ["full"] }
+tower-lsp = "0.20.0"
+dashmap = "6.2.1"
