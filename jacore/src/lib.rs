@@ -6,7 +6,7 @@ pub mod parser;
 pub mod preprocessor;
 pub mod scanner;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Span {
     pub offset: usize,
     pub length: usize,
@@ -25,7 +25,7 @@ impl Span {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Spanned<T> {
     pub value: T,
     pub span: Span,

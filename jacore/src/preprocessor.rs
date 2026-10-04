@@ -2,7 +2,6 @@ use crate::lexer::{Semantic, SemanticToken, Token, dummy};
 use crate::{Span, Spanned, format_unexpected_token_error, get_source_len_from_tokens};
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::fmt::Formatter;
 
 #[derive(Debug)]
 pub enum Error {
@@ -17,7 +16,7 @@ pub enum Error {
 }
 
 impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::UnexpectedToken {
                 unexpected,
@@ -55,6 +54,7 @@ impl<'s> Preprocessor<'s> {
         }
     }
 
+    #[allow(dead_code)]
     fn peek(&mut self) -> Option<Spanned<&'s Token>> {
         self.tokens.get(self.offset).map(
             |Spanned {

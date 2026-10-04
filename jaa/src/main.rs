@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     log::info!("Tokenizing...");
-    let mut tokens = lexer::tokenize(&source).map_err(|e| e.into_inner())?;
+    let tokens = lexer::tokenize(&source).map_err(|e| e.into_inner())?;
     if log::log_enabled!(log::Level::Debug) {
         log::info!("Tokenized {} tokens:", tokens.len());
         for (index, token) in tokens.iter().enumerate() {

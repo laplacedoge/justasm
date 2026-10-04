@@ -106,9 +106,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "bilge"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2901ed1bd7b6495a11c0bc1e177dd7609f2b564ea340a6eb341fd57c8abd018e"
+checksum = "ce06e2f5d1e0c7905e6ccbfa5dca192471a5e821cb686d20816e63750795ffb2"
 dependencies = [
  "arbitrary-int",
  "bilge-impl",
@@ -116,9 +116,9 @@ dependencies = [
 
 [[package]]
 name = "bilge-impl"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f270ce62922c312d545cff3dc47de5cd224283415550e5121aeea6bd1b4317f0"
+checksum = "a2b578a200457fce52407a0a75734057c6f35c1f3237e2c200a102a0efa8d6b6"
 dependencies = [
  "itertools",
  "manyhow",
@@ -594,6 +594,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "indoc"
+version = "2.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -631,6 +640,7 @@ name = "jacore"
 version = "0.1.0"
 dependencies = [
  "bilge",
+ "indoc",
 ]
 
 [[package]]

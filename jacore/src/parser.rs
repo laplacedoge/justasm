@@ -1,7 +1,7 @@
 use crate::lexer::{Semantic, SemanticToken, Token, dummy};
 use crate::{Span, Spanned, format_unexpected_token_error};
+use bilge::prelude::*;
 use std::borrow::Cow;
-use std::convert::Into;
 
 #[derive(Debug)]
 pub enum Error {
@@ -10,13 +10,18 @@ pub enum Error {
         expected: Vec<&'static Token>,
     },
     UnexpectedEos,
+    UnavailableInstruction {
+        name: String,
+    },
     UnknownInstruction {
         name: String,
     },
     UnknownGpRegister {
         name: String,
     },
-    InvalidLiteral,
+    IntegerOverflow {
+        value: Option<isize>,
+    },
 }
 
 impl Error {
@@ -38,15 +43,19 @@ impl std::fmt::Display for Error {
             Error::UnexpectedEos => {
                 write!(f, "Unexpected EOS")
             }
+            Error::UnavailableInstruction { name } => {
+                write!(f, "Unavailable instruction '{}'", name)
+            }
             Error::UnknownInstruction { name } => {
                 write!(f, "Unknown instruction '{}'", name)
             }
             Error::UnknownGpRegister { name } => {
                 write!(f, "Unknown general purpose register '{}'", name)
             }
-            Error::InvalidLiteral {} => {
-                write!(f, "Invalid literal")
-            }
+            Error::IntegerOverflow { value } => match value {
+                Some(value) => write!(f, "Integer '{}' overflows", value),
+                None => write!(f, "Integer overflow"),
+            },
         }
     }
 }
@@ -55,119 +64,253 @@ impl std::error::Error for Error {}
 
 pub type Word = u16;
 
-#[derive(Debug, Clone)]
-pub struct BoundedWord<const N: usize> {
-    value: Word,
+const OPC_BIN: u4 = u4::new(0b0000);
+const BIN_FN_ADD: u3 = u3::new(0b000);
+const BIN_FN_SUB: u3 = u3::new(0b001);
+const BIN_FN_NOR: u3 = u3::new(0b010);
+const BIN_FN_AND: u3 = u3::new(0b011);
+const BIN_FN_XOR: u3 = u3::new(0b100);
+const BIN_FN_LSL: u3 = u3::new(0b101);
+const BIN_FN_LSR: u3 = u3::new(0b110);
+const BIN_FN_ASR: u3 = u3::new(0b111);
+
+const OPC_JP0: u4 = u4::new(0b0001);
+const JP0_FN_JPP: u1 = u1::new(0b0);
+const JP0_FN_JLP: u1 = u1::new(0b1);
+
+const OPC_JP1: u4 = u4::new(0b0010);
+const JP1_FN_JPR: u1 = u1::new(0b0);
+const JP1_FN_JLR: u1 = u1::new(0b1);
+
+const OPC_JP2: u4 = u4::new(0b0011);
+const JP2_FN_BEQ: u1 = u1::new(0b0);
+const JP2_FN_BNE: u1 = u1::new(0b1);
+
+const OPC_JP3: u4 = u4::new(0b0100);
+const JP3_FN_BHI: u1 = u1::new(0b0);
+const JP3_FN_BGT: u1 = u1::new(0b1);
+
+const OPC_JP4: u4 = u4::new(0b0101);
+const JP4_FN_BHS: u1 = u1::new(0b0);
+const JP4_FN_BGE: u1 = u1::new(0b1);
+
+const OPC_JP5: u4 = u4::new(0b0110);
+const JP5_FN_BLO: u1 = u1::new(0b0);
+const JP5_FN_BLT: u1 = u1::new(0b1);
+
+const OPC_JP6: u4 = u4::new(0b0111);
+const JP6_FN_BLS: u1 = u1::new(0b0);
+const JP6_FN_BLE: u1 = u1::new(0b1);
+
+const OPC_LLI: u4 = u4::new(0b1000);
+const OPC_LUI: u4 = u4::new(0b1001);
+const OPC_ADI: u4 = u4::new(0b1010);
+
+const OPC_LOD: u4 = u4::new(0b1011);
+const LOD_FN_LDB: u1 = u1::new(0b0);
+const LOD_FN_LDW: u1 = u1::new(0b1);
+
+const OPC_STR: u4 = u4::new(0b1100);
+const STR_FN_STB: u1 = u1::new(0b0);
+const STR_FN_STW: u1 = u1::new(0b1);
+
+pub const GP_REG_0: u3 = u3::new(0);
+pub const GP_REG_1: u3 = u3::new(1);
+pub const GP_REG_2: u3 = u3::new(2);
+pub const GP_REG_3: u3 = u3::new(3);
+pub const GP_REG_4: u3 = u3::new(4);
+pub const GP_REG_5: u3 = u3::new(5);
+pub const GP_REG_6: u3 = u3::new(6);
+pub const GP_REG_7: u3 = u3::new(7);
+pub const GP_REG_SP: u3 = u3::new(6);
+pub const GP_REG_LR: u3 = u3::new(7);
+pub const GP_REG_JUMP_ASSIST: u3 = u3::new(5);
+
+pub trait UnsignedIntoChecked<T> {
+    const MAX: usize;
+    fn into_checked(self) -> Option<T>;
 }
 
-impl<const N: usize> BoundedWord<N> {
-    pub const MAX: Word = if N >= Word::BITS as usize {
-        Word::MAX
-    } else {
-        (1 << N) - 1
-    };
-
-    pub fn new(value: Word) -> Option<Self> {
-        if value <= Self::MAX {
-            Some(Self { value })
-        } else {
+impl<const BITS: usize> UnsignedIntoChecked<UInt<u8, BITS>> for usize {
+    const MAX: usize = (1 << BITS) - 1;
+    fn into_checked(self) -> Option<UInt<u8, BITS>> {
+        if self > <Self as UnsignedIntoChecked<UInt<u8, BITS>>>::MAX {
             None
-        }
-    }
-
-    pub fn new_truncated(value: Word) -> Self {
-        Self {
-            value: value & Self::MAX,
-        }
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        self.value as u8
-    }
-
-    pub fn as_u16(&self) -> u16 {
-        self.value
-    }
-
-    pub fn load_separately(magnitude: usize, negative: bool) -> Option<BoundedWord<N>> {
-        let signed = if negative {
-            (magnitude as isize).checked_neg()?
         } else {
-            if magnitude > isize::MAX as usize {
-                return None;
-            } else {
-                magnitude as isize
-            }
-        };
-
-        let min = -(1 << (N - 1));
-        let max = (1 << (N - 1)) - 1;
-        if signed < min || signed > max {
-            return None;
+            Some(unsafe { UInt::<u8, BITS>::new_unchecked(self as u8) })
         }
-
-        Some(BoundedWord {
-            value: (signed as Word) & Self::MAX,
-        })
     }
 }
 
-impl<const N: usize> From<BoundedWord<N>> for Word {
-    fn from(value: BoundedWord<N>) -> Self {
-        value.value
+impl<const BITS: usize> UnsignedIntoChecked<UInt<u16, BITS>> for usize {
+    const MAX: usize = (1 << BITS) - 1;
+    fn into_checked(self) -> Option<UInt<u16, BITS>> {
+        if self > <Self as UnsignedIntoChecked<UInt<u16, BITS>>>::MAX {
+            None
+        } else {
+            Some(unsafe { UInt::<u16, BITS>::new_unchecked(self as u16) })
+        }
     }
 }
 
-impl<const N: usize> From<BoundedWord<N>> for u8 {
-    fn from(value: BoundedWord<N>) -> Self {
-        value.value as u8
+pub trait SignedIntoChecked<T> {
+    const MASK: usize;
+    const MIN: isize;
+    const MAX: isize;
+    fn into_checked(self) -> Option<T>;
+}
+
+impl<const BITS: usize> SignedIntoChecked<Int<i8, BITS>> for isize {
+    const MASK: usize = (1 << BITS) - 1;
+    const MIN: isize = (1 << (BITS - 1)) - 1;
+    const MAX: isize = -(1 << (BITS - 1));
+    fn into_checked(self) -> Option<Int<i8, BITS>> {
+        if self < <Self as SignedIntoChecked<Int<i8, BITS>>>::MIN
+            || self > <Self as SignedIntoChecked<Int<i8, BITS>>>::MAX
+        {
+            None
+        } else {
+            Some(unsafe {
+                Int::<i8, BITS>::new_unchecked(
+                    ((self as usize) & <Self as SignedIntoChecked<Int<i8, BITS>>>::MASK) as i8,
+                )
+            })
+        }
     }
 }
 
-impl<const N: usize> From<Word> for BoundedWord<N> {
-    fn from(value: Word) -> Self {
-        BoundedWord::new_truncated(value)
+impl<const BITS: usize> SignedIntoChecked<Int<i16, BITS>> for isize {
+    const MASK: usize = (1 << BITS) - 1;
+    const MIN: isize = -(1 << (BITS - 1));
+    const MAX: isize = (1 << (BITS - 1)) - 1;
+    fn into_checked(self) -> Option<Int<i16, BITS>> {
+        if self < <Self as SignedIntoChecked<Int<i16, BITS>>>::MIN
+            || self > <Self as SignedIntoChecked<Int<i16, BITS>>>::MAX
+        {
+            None
+        } else {
+            Some(unsafe {
+                Int::<i16, BITS>::new_unchecked(
+                    ((self as usize) & <Self as SignedIntoChecked<Int<i16, BITS>>>::MASK) as i16,
+                )
+            })
+        }
     }
 }
 
-#[derive(Debug)]
+#[bitsize(16)]
+#[derive(Clone, Copy, PartialEq, FromBits, DebugBits)]
 pub struct FormatA {
-    pub rd: BoundedWord<3>,
-    pub rs1: BoundedWord<3>,
-    pub rs2: BoundedWord<3>,
+    opc: u4,
+    fun: u3,
+    rs1: u3,
+    rs2: u3,
+    rd: u3,
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for FormatA {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opc: {:#06b}, fn: {:#b}, rs1: {}, rs2: {}, rd: {}",
+            self.opc(),
+            self.fun(),
+            self.rs1(),
+            self.rs2(),
+            self.rd(),
+        )
+    }
+}
+
+#[bitsize(16)]
+#[derive(Clone, Copy, PartialEq, FromBits, DebugBits)]
 pub struct FormatB {
-    pub label: String,
+    opc: u4,
+    fun: u1,
+    off: i11,
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for FormatB {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opc: {:#06b}, fn: {:#b}, off: {:}",
+            self.opc(),
+            self.fun(),
+            self.off().as_isize(),
+        )
+    }
+}
+
+#[bitsize(16)]
+#[derive(Clone, Copy, PartialEq, FromBits, DebugBits)]
 pub struct FormatC {
-    pub rd: BoundedWord<3>,
-    pub label: String,
+    opc: u4,
+    fun: u1,
+    off: i8,
+    rd: u3,
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for FormatC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opc: {:#06b}, fn: {:#b}, off: {:}, rd: {}",
+            self.opc(),
+            self.fun(),
+            self.off().as_isize(),
+            self.rd(),
+        )
+    }
+}
+
+#[bitsize(16)]
+#[derive(Clone, Copy, PartialEq, FromBits, DebugBits)]
 pub struct FormatD {
-    pub label: String,
+    opc: u4,
+    off: u9,
+    rd: u3,
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for FormatD {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opc: {:#06b}, off: {:}, rd: {}",
+            self.opc(),
+            self.off().as_isize(),
+            self.rd(),
+        )
+    }
+}
+
+#[bitsize(16)]
+#[derive(Clone, Copy, PartialEq, FromBits, DebugBits)]
 pub struct FormatE {
-    pub rd: BoundedWord<3>,
-    pub imm: BoundedWord<9>,
+    opc: u4,
+    fun: u1,
+    off: i5,
+    rs: u3,
+    rd: u3,
 }
 
-#[derive(Debug)]
-pub struct FormatF {
-    pub rd: BoundedWord<3>,
-    pub rs: BoundedWord<3>,
-    pub off: BoundedWord<5>,
+impl std::fmt::Display for FormatE {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opc: {:#06b}, fn: {:#b}, off: {}, rs: {}, rd: {}",
+            self.opc(),
+            self.fun(),
+            self.off().as_isize(),
+            self.rs(),
+            self.rd()
+        )
+    }
 }
 
-#[derive(Debug)]
-pub enum Instruction {
+/// Instructions represented in binary form
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinaryForm {
     Add(FormatA),
     Sub(FormatA),
     Nor(FormatA),
@@ -176,45 +319,269 @@ pub enum Instruction {
     Lsl(FormatA),
     Lsr(FormatA),
     Asr(FormatA),
+
+    Jpp(FormatB),
     Jlp(FormatB),
+
+    Jpr(FormatC),
     Jlr(FormatC),
-    Jmp(FormatD),
-    Beq(FormatD),
-    Bne(FormatD),
-    Bhi(FormatD),
-    Bgt(FormatD),
-    Bhs(FormatD),
-    Bge(FormatD),
-    Blo(FormatD),
-    Blt(FormatD),
-    Bls(FormatD),
-    Ble(FormatD),
-    Lli(FormatE),
-    Lui(FormatE),
-    Adi(FormatE),
-    Ldb(FormatF),
-    Ldw(FormatF),
-    Stb(FormatF),
-    Stw(FormatF),
+
+    Beq(FormatB),
+    Bne(FormatB),
+    Bhi(FormatB),
+    Bgt(FormatB),
+    Bhs(FormatB),
+    Bge(FormatB),
+    Blo(FormatB),
+    Blt(FormatB),
+    Bls(FormatB),
+    Ble(FormatB),
+
+    Lli(FormatD),
+    Lui(FormatD),
+    Adi(FormatD),
+
+    Ldb(FormatE),
+    Ldw(FormatE),
+    Stb(FormatE),
+    Stw(FormatE),
 }
 
-#[derive(Debug)]
-pub enum MacroInstruction {
-    Single(Instruction),
-    Expanded(Vec<Instruction>),
+impl BinaryForm {
+    pub fn add(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Add(FormatA::new(OPC_BIN, BIN_FN_ADD, rs1, rs2, rd))
+    }
+
+    pub fn sub(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Sub(FormatA::new(OPC_BIN, BIN_FN_SUB, rs1, rs2, rd))
+    }
+
+    pub fn nor(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Nor(FormatA::new(OPC_BIN, BIN_FN_NOR, rs1, rs2, rd))
+    }
+
+    pub fn and(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::And(FormatA::new(OPC_BIN, BIN_FN_AND, rs1, rs2, rd))
+    }
+
+    pub fn xor(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Xor(FormatA::new(OPC_BIN, BIN_FN_XOR, rs1, rs2, rd))
+    }
+
+    pub fn lsl(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Lsl(FormatA::new(OPC_BIN, BIN_FN_LSL, rs1, rs2, rd))
+    }
+
+    pub fn lsr(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Lsr(FormatA::new(OPC_BIN, BIN_FN_LSR, rs1, rs2, rd))
+    }
+
+    pub fn asr(rd: u3, rs1: u3, rs2: u3) -> Self {
+        BinaryForm::Asr(FormatA::new(OPC_BIN, BIN_FN_ASR, rs1, rs2, rd))
+    }
+
+    pub fn jpp(off: i11) -> Self {
+        BinaryForm::Jpp(FormatB::new(OPC_JP0, JP0_FN_JPP, off))
+    }
+
+    pub fn jlp(off: i11) -> Self {
+        BinaryForm::Jlp(FormatB::new(OPC_JP0, JP0_FN_JLP, off))
+    }
+
+    pub fn jpr(rd: u3, off: i8) -> Self {
+        BinaryForm::Jpr(FormatC::new(OPC_JP1, JP1_FN_JPR, off, rd))
+    }
+
+    pub fn jlr(rd: u3, off: i8) -> Self {
+        BinaryForm::Jlr(FormatC::new(OPC_JP1, JP1_FN_JLR, off, rd))
+    }
+
+    pub fn beq(off: i11) -> Self {
+        BinaryForm::Beq(FormatB::new(OPC_JP2, JP2_FN_BEQ, off))
+    }
+
+    pub fn bne(off: i11) -> Self {
+        BinaryForm::Bne(FormatB::new(OPC_JP2, JP2_FN_BNE, off))
+    }
+
+    pub fn bhi(off: i11) -> Self {
+        BinaryForm::Bhi(FormatB::new(OPC_JP3, JP3_FN_BHI, off))
+    }
+
+    pub fn bgt(off: i11) -> Self {
+        BinaryForm::Bgt(FormatB::new(OPC_JP3, JP3_FN_BGT, off))
+    }
+
+    pub fn bhs(off: i11) -> Self {
+        BinaryForm::Bhs(FormatB::new(OPC_JP4, JP4_FN_BHS, off))
+    }
+
+    pub fn bge(off: i11) -> Self {
+        BinaryForm::Bge(FormatB::new(OPC_JP4, JP4_FN_BGE, off))
+    }
+
+    pub fn blo(off: i11) -> Self {
+        BinaryForm::Blo(FormatB::new(OPC_JP5, JP5_FN_BLO, off))
+    }
+
+    pub fn blt(off: i11) -> Self {
+        BinaryForm::Blt(FormatB::new(OPC_JP5, JP5_FN_BLT, off))
+    }
+
+    pub fn bls(off: i11) -> Self {
+        BinaryForm::Bls(FormatB::new(OPC_JP6, JP6_FN_BLS, off))
+    }
+
+    pub fn ble(off: i11) -> Self {
+        BinaryForm::Ble(FormatB::new(OPC_JP6, JP6_FN_BLE, off))
+    }
+
+    pub fn lli(rd: u3, imm: u9) -> Self {
+        BinaryForm::Lli(FormatD::new(OPC_LLI, imm, rd))
+    }
+
+    pub fn lui(rd: u3, imm: u9) -> Self {
+        BinaryForm::Lui(FormatD::new(OPC_LUI, imm, rd))
+    }
+
+    pub fn adi(rd: u3, imm: u9) -> Self {
+        BinaryForm::Adi(FormatD::new(OPC_ADI, imm, rd))
+    }
+
+    pub fn ldb(rd: u3, rs: u3, off: i5) -> Self {
+        BinaryForm::Ldb(FormatE::new(OPC_LOD, LOD_FN_LDB, off, rs, rd))
+    }
+
+    pub fn ldw(rd: u3, rs: u3, off: i5) -> Self {
+        BinaryForm::Ldw(FormatE::new(OPC_LOD, LOD_FN_LDW, off, rs, rd))
+    }
+
+    pub fn stb(rd: u3, off: i5, rs: u3) -> Self {
+        BinaryForm::Stb(FormatE::new(OPC_STR, STR_FN_STB, off, rs, rd))
+    }
+
+    pub fn stw(rd: u3, off: i5, rs: u3) -> Self {
+        BinaryForm::Stw(FormatE::new(OPC_STR, STR_FN_STW, off, rs, rd))
+    }
+
+    pub fn value(&self) -> u16 {
+        match self {
+            BinaryForm::Add(f) => f.value,
+            BinaryForm::Sub(f) => f.value,
+            BinaryForm::Nor(f) => f.value,
+            BinaryForm::And(f) => f.value,
+            BinaryForm::Xor(f) => f.value,
+            BinaryForm::Lsl(f) => f.value,
+            BinaryForm::Lsr(f) => f.value,
+            BinaryForm::Asr(f) => f.value,
+            BinaryForm::Jpp(f) => f.value,
+            BinaryForm::Jlp(f) => f.value,
+            BinaryForm::Jpr(f) => f.value,
+            BinaryForm::Jlr(f) => f.value,
+            BinaryForm::Beq(f) => f.value,
+            BinaryForm::Bne(f) => f.value,
+            BinaryForm::Bhi(f) => f.value,
+            BinaryForm::Bgt(f) => f.value,
+            BinaryForm::Bhs(f) => f.value,
+            BinaryForm::Bge(f) => f.value,
+            BinaryForm::Blo(f) => f.value,
+            BinaryForm::Blt(f) => f.value,
+            BinaryForm::Bls(f) => f.value,
+            BinaryForm::Ble(f) => f.value,
+            BinaryForm::Lli(f) => f.value,
+            BinaryForm::Lui(f) => f.value,
+            BinaryForm::Adi(f) => f.value,
+            BinaryForm::Ldb(f) => f.value,
+            BinaryForm::Ldw(f) => f.value,
+            BinaryForm::Stb(f) => f.value,
+            BinaryForm::Stw(f) => f.value,
+        }
+    }
 }
 
-#[derive(Debug)]
+impl std::fmt::Display for BinaryForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BinaryForm::Add(format) => write!(f, "ADD[{}]", format),
+            BinaryForm::Sub(format) => write!(f, "SUB[{}]", format),
+            BinaryForm::Nor(format) => write!(f, "NOR[{}]", format),
+            BinaryForm::And(format) => write!(f, "AND[{}]", format),
+            BinaryForm::Xor(format) => write!(f, "XOR[{}]", format),
+            BinaryForm::Lsl(format) => write!(f, "LSL[{}]", format),
+            BinaryForm::Lsr(format) => write!(f, "LSR[{}]", format),
+            BinaryForm::Asr(format) => write!(f, "ASR[{}]", format),
+            BinaryForm::Jpp(format) => write!(f, "JPP[{}]", format),
+            BinaryForm::Jlp(format) => write!(f, "JLP[{}]", format),
+            BinaryForm::Jpr(format) => write!(f, "JPR[{}]", format),
+            BinaryForm::Jlr(format) => write!(f, "JLR[{}]", format),
+            BinaryForm::Beq(format) => write!(f, "BEQ[{}]", format),
+            BinaryForm::Bne(format) => write!(f, "BNE[{}]", format),
+            BinaryForm::Bhi(format) => write!(f, "BHI[{}]", format),
+            BinaryForm::Bgt(format) => write!(f, "BGT[{}]", format),
+            BinaryForm::Bhs(format) => write!(f, "BHS[{}]", format),
+            BinaryForm::Bge(format) => write!(f, "BGE[{}]", format),
+            BinaryForm::Blo(format) => write!(f, "BLO[{}]", format),
+            BinaryForm::Blt(format) => write!(f, "BLT[{}]", format),
+            BinaryForm::Bls(format) => write!(f, "BLS[{}]", format),
+            BinaryForm::Ble(format) => write!(f, "BLE[{}]", format),
+            BinaryForm::Lli(format) => write!(f, "LLI[{}]", format),
+            BinaryForm::Lui(format) => write!(f, "LUI[{}]", format),
+            BinaryForm::Adi(format) => write!(f, "ADI[{}]", format),
+            BinaryForm::Ldb(format) => write!(f, "LDB[{}]", format),
+            BinaryForm::Ldw(format) => write!(f, "LDW[{}]", format),
+            BinaryForm::Stb(format) => write!(f, "STB[{}]", format),
+            BinaryForm::Stw(format) => write!(f, "STW[{}]", format),
+        }
+    }
+}
+
+/// Jump instructions in which the target is represented by label string
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolicForm {
+    /// Unconditional jump
+    Jmp(String),
+
+    /// Unconditional jump and link
+    Cal(String),
+
+    /// Conditional branch
+    Beq(String),
+    Bne(String),
+    Bhi(String),
+    Bgt(String),
+    Bhs(String),
+    Bge(String),
+    Blo(String),
+    Blt(String),
+    Bls(String),
+    Ble(String),
+}
+
+/// Pseudo instructions
+#[derive(Debug, PartialEq)]
+pub enum PseudoForm {
+    Lwi { rd: u3, imm: u16 },
+    Ret,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Instruction {
+    BinaryForm(BinaryForm),
+    SymbolicForm(SymbolicForm),
+    PseudoForm(PseudoForm),
+}
+
+#[derive(Debug, PartialEq)]
 pub struct LocalBlock {
     pub label: Spanned<String>,
     pub instructions: Vec<Spanned<Instruction>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct GlobalBlock {
     pub label: Spanned<String>,
     pub instructions: Vec<Spanned<Instruction>>,
-    pub subblocks: Vec<LocalBlock>,
+    pub local_blocks: Vec<LocalBlock>,
 }
 
 pub struct Parser<'t> {
@@ -224,12 +591,12 @@ pub struct Parser<'t> {
 }
 
 trait SourceStr {
-    fn parse_gp_register(&self) -> Result<BoundedWord<3>, String>;
+    fn parse_gp_register(&self) -> Result<u3, String>;
 }
 
 impl SourceStr for str {
-    fn parse_gp_register(&self) -> Result<BoundedWord<3>, String> {
-        Ok(match self {
+    fn parse_gp_register(&self) -> Result<u3, String> {
+        Ok(u3::new(match self {
             "r0" | "zr" => 0,
             "r1" => 1,
             "r2" => 2,
@@ -239,8 +606,7 @@ impl SourceStr for str {
             "r6" | "sp" => 6,
             "r7" | "lr" => 7,
             _ => return Err(self.to_string()),
-        }
-        .into())
+        }))
     }
 }
 
@@ -335,6 +701,7 @@ impl<'t> Parser<'t> {
         self.consume_any(&[(token, semantic)])
     }
 
+    #[allow(dead_code)]
     fn consume_name(
         &mut self,
         semantic: Option<Semantic>,
@@ -345,6 +712,17 @@ impl<'t> Parser<'t> {
                 _ => std::hint::unreachable_unchecked(),
             }
         }))
+    }
+
+    fn consume_label(&mut self) -> Result<Spanned<String>, Spanned<Error>> {
+        Ok(self
+            .consume_this(&dummy::NAME, Some(Semantic::Label))?
+            .map(|t| unsafe {
+                match t {
+                    Token::Name(name) => name.to_owned(),
+                    _ => std::hint::unreachable_unchecked(),
+                }
+            }))
     }
 
     fn expect_mnemonic(&mut self) -> Option<(Spanned<String>, &SemanticToken)> {
@@ -417,7 +795,7 @@ impl<'t> Parser<'t> {
         ))
     }
 
-    fn consume_gp_register(&mut self) -> Result<Spanned<BoundedWord<3>>, Spanned<Error>> {
+    fn consume_gp_register(&mut self) -> Result<Spanned<u3>, Spanned<Error>> {
         if let Some(Spanned {
             value:
                 SemanticToken {
@@ -450,7 +828,7 @@ impl<'t> Parser<'t> {
         ))
     }
 
-    fn parse_format_a(&mut self) -> Result<Spanned<FormatA>, Spanned<Error>> {
+    fn parse_format_a(&mut self, opc: u4, fun: u3) -> Result<Spanned<FormatA>, Spanned<Error>> {
         let rd = self.consume_gp_register()?;
 
         self.consume_this(&dummy::COMMA, None)?;
@@ -463,30 +841,36 @@ impl<'t> Parser<'t> {
 
         let span = rd.merge_span(&rs2);
         Ok(Spanned::new(
-            FormatA {
-                rs1: rs1.into_inner(),
-                rs2: rs2.into_inner(),
-                rd: rd.into_inner(),
-            },
+            FormatA::new(opc, fun, rs1.value, rs2.value, rd.value),
             span,
         ))
     }
 
-    fn parse_format_b(&mut self) -> Result<Spanned<FormatB>, Spanned<Error>> {
-        let Spanned { value: label, span } = self.consume_name(Some(Semantic::Label))?;
-
-        Ok(Spanned::new(FormatB { label }, span))
-    }
-
-    fn parse_format_d(&mut self) -> Result<Spanned<FormatD>, Spanned<Error>> {
-        let Spanned { value: label, span } = self.consume_name(Some(Semantic::Label))?;
-
-        Ok(Spanned::new(FormatD { label }, span))
-    }
-
-    fn parse_possibly_signed_integer<const N: usize>(
+    fn parse_integer<T, const BITS: usize>(
         &mut self,
-    ) -> Result<Spanned<BoundedWord<N>>, Spanned<Error>> {
+    ) -> Result<Spanned<UInt<T, BITS>>, Spanned<Error>>
+    where
+        T: UnsignedInteger + BuiltinInteger,
+        usize: UnsignedIntoChecked<UInt<T, BITS>>,
+    {
+        let Spanned {
+            value: magnitude,
+            span,
+        } = self.consume_integer()?;
+        let value = magnitude.into_checked().ok_or(Spanned::new(
+            Error::IntegerOverflow { value: None },
+            span.clone(),
+        ))?;
+        Ok(Spanned::new(value, span))
+    }
+
+    fn parse_possibly_signed_integer<T, const BITS: usize>(
+        &mut self,
+    ) -> Result<Spanned<Int<T, BITS>>, Spanned<Error>>
+    where
+        T: SignedInteger + BuiltinInteger,
+        isize: SignedIntoChecked<Int<T, BITS>>,
+    {
         let negative;
         let sign_span;
         if let Some(t) = self.expect_this(&dummy::PLUS, None) {
@@ -504,34 +888,54 @@ impl<'t> Parser<'t> {
             value: magnitude,
             span: value_span,
         } = self.consume_integer()?;
-        let value = BoundedWord::<N>::load_separately(magnitude, negative)
-            .ok_or(Spanned::new(Error::InvalidLiteral, value_span.clone()))?;
         let new_span = match sign_span {
             Some(s) => s.merge(&value_span),
             None => value_span,
         };
+        let widened_magnitude: isize = magnitude
+            .try_into()
+            .map_err(|_| Spanned::new(Error::IntegerOverflow { value: None }, new_span.clone()))?;
+        let signed_value = if negative {
+            widened_magnitude.checked_neg().ok_or_else(|| {
+                Spanned::new(Error::IntegerOverflow { value: None }, new_span.clone())
+            })?
+        } else {
+            widened_magnitude
+        };
 
+        let value = signed_value.into_checked().ok_or(Spanned::new(
+            Error::IntegerOverflow { value: None },
+            new_span.clone(),
+        ))?;
         Ok(Spanned::new(value, new_span))
     }
 
-    fn parse_format_e(&mut self) -> Result<Spanned<FormatE>, Spanned<Error>> {
+    fn parse_format_d_lli_lui(&mut self, opc: u4) -> Result<Spanned<FormatD>, Spanned<Error>> {
         let rd = self.consume_gp_register()?;
 
         self.consume_this(&dummy::COMMA, None)?;
 
-        let imm = self.parse_possibly_signed_integer::<9>()?;
+        let imm = self.parse_integer()?;
+
+        let span = rd.merge_span(&imm);
+        Ok(Spanned::new(FormatD::new(opc, imm.value, rd.value), span))
+    }
+
+    fn parse_format_d_adi(&mut self, opc: u4) -> Result<Spanned<FormatD>, Spanned<Error>> {
+        let rd = self.consume_gp_register()?;
+
+        self.consume_this(&dummy::COMMA, None)?;
+
+        let imm: Spanned<i9> = self.parse_possibly_signed_integer()?;
 
         let span = rd.merge_span(&imm);
         Ok(Spanned::new(
-            FormatE {
-                rd: rd.into_inner(),
-                imm: imm.into_inner(),
-            },
+            FormatD::new(opc, u9::from_u16(imm.value.to_bits()), rd.value),
             span,
         ))
     }
 
-    fn parse_format_f_ld(&mut self) -> Result<Spanned<FormatF>, Spanned<Error>> {
+    fn parse_format_e_ld(&mut self, opc: u4, fun: u1) -> Result<Spanned<FormatE>, Spanned<Error>> {
         let Spanned {
             value: rd,
             span: start_span,
@@ -544,9 +948,9 @@ impl<'t> Parser<'t> {
         let rs = self.consume_gp_register()?.value;
 
         let (off, end_span) = match self.expect_this(&dummy::RIGHT_BRACKET, None) {
-            Some(t) => (BoundedWord::new_truncated(0), t.span.to_owned()),
+            Some(t) => (i5::new(0), t.span.to_owned()),
             None => {
-                let off = self.parse_possibly_signed_integer::<5>()?.into_inner();
+                let off = self.parse_possibly_signed_integer()?.value;
 
                 let span = self
                     .consume_this(&dummy::RIGHT_BRACKET, None)?
@@ -558,12 +962,12 @@ impl<'t> Parser<'t> {
         };
 
         Ok(Spanned::new(
-            FormatF { rd, rs, off },
+            FormatE::new(opc, fun, off, rs, rd),
             start_span.merge(&end_span),
         ))
     }
 
-    fn parse_format_f_st(&mut self) -> Result<Spanned<FormatF>, Spanned<Error>> {
+    fn parse_format_e_st(&mut self, opc: u4, fun: u1) -> Result<Spanned<FormatE>, Spanned<Error>> {
         let start_span = self
             .consume_this(&dummy::LEFT_BRACKET, None)?
             .span
@@ -572,9 +976,9 @@ impl<'t> Parser<'t> {
         let rd = self.consume_gp_register()?.value;
 
         let off = match self.expect_this(&dummy::RIGHT_BRACKET, None) {
-            Some(_) => BoundedWord::new_truncated(0),
+            Some(_) => i5::new(0),
             None => {
-                let off = self.parse_possibly_signed_integer::<5>()?.into_inner();
+                let off = self.parse_possibly_signed_integer()?.into_inner();
 
                 self.consume_this(&dummy::RIGHT_BRACKET, None)?;
 
@@ -590,194 +994,185 @@ impl<'t> Parser<'t> {
         } = self.consume_gp_register()?;
 
         Ok(Spanned::new(
-            FormatF { rd, rs, off },
+            FormatE::new(opc, fun, off, rs, rd),
             start_span.merge(&end_span),
         ))
     }
 
-    fn parse_pesudo_instruction_lwi(
-        &mut self,
-    ) -> Result<Spanned<MacroInstruction>, Spanned<Error>> {
-        let rd = self.consume_gp_register()?;
-        let rd_value = rd.value.clone();
-
-        self.consume_this(&dummy::COMMA, None)?;
-
-        let imm = self.parse_possibly_signed_integer::<16>()?;
-
-        let mut instructions = vec![];
-        let imm_value = imm.value.as_u16();
-        if imm_value == 0 {
-            instructions.push(Instruction::Add(FormatA {
-                rd: rd_value,
-                rs1: 0u16.into(),
-                rs2: 0u16.into(),
-            }));
-        } else if imm_value & 0b0000_0001_1111_1111 != 0 && imm_value & 0b1111_1110_0000_0000 == 0 {
-            instructions.push(Instruction::Lli(FormatE {
-                rd: rd_value,
-                imm: imm_value.into(),
-            }));
-        } else if imm_value & 0b1111_1111_1000_0000 != 0 && imm_value & 0b0000_0000_0111_1111 == 0 {
-            instructions.push(Instruction::Lui(FormatE {
-                rd: rd_value,
-                imm: (imm_value >> 7).into(),
-            }));
-        } else {
-            instructions.push(Instruction::Lui(FormatE {
-                rd: rd_value.clone(),
-                imm: (imm_value >> 7).into(),
-            }));
-            instructions.push(Instruction::Adi(FormatE {
-                rd: rd_value,
-                imm: (imm_value & 0b0000_0000_0111_1111).into(),
-            }));
-        }
-
-        Ok(Spanned::new(
-            MacroInstruction::Expanded(instructions),
-            rd.merge_span(&imm),
-        ))
-    }
-
-    fn parse_macro_instruction(
-        &mut self,
-    ) -> Result<Option<Spanned<MacroInstruction>>, Spanned<Error>> {
+    fn parse_instruction(&mut self) -> Result<Option<Spanned<Instruction>>, Spanned<Error>> {
         if let Some((
             Spanned {
                 span: mnemonic_span,
-                value,
+                value: name,
             },
             SemanticToken { semantic, .. },
         )) = self.expect_mnemonic()
         {
             semantic.set(Some(Semantic::Instruction));
-            let (instruction, operand_span) = match value.as_str() {
+            let (instruction, operand_span) = match name.as_ref() {
                 "add" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Add(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_ADD)?;
+                    (Instruction::BinaryForm(BinaryForm::Add(value)), span)
                 }
                 "sub" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Sub(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_SUB)?;
+                    (Instruction::BinaryForm(BinaryForm::Sub(value)), span)
                 }
                 "nor" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Nor(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_NOR)?;
+                    (Instruction::BinaryForm(BinaryForm::Nor(value)), span)
                 }
                 "and" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::And(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_AND)?;
+                    (Instruction::BinaryForm(BinaryForm::And(value)), span)
                 }
                 "xor" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Xor(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_XOR)?;
+                    (Instruction::BinaryForm(BinaryForm::Xor(value)), span)
                 }
                 "lsl" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Lsl(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_LSL)?;
+                    (Instruction::BinaryForm(BinaryForm::Lsl(value)), span)
                 }
                 "lsr" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Lsr(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_LSR)?;
+                    (Instruction::BinaryForm(BinaryForm::Lsr(value)), span)
                 }
                 "asr" => {
-                    let Spanned { value, span } = self.parse_format_a()?;
-                    (MacroInstruction::Single(Instruction::Asr(value)), span)
+                    let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_ASR)?;
+                    (Instruction::BinaryForm(BinaryForm::Asr(value)), span)
                 }
 
-                "jlp" => {
-                    let Spanned { value, span } = self.parse_format_b()?;
-                    (MacroInstruction::Single(Instruction::Jlp(value)), span)
+                "jpp" | "jlp" | "jpr" | "jlr" => {
+                    return Err(Spanned::new(
+                        Error::UnavailableInstruction { name },
+                        mnemonic_span,
+                    ));
                 }
 
-                "jlr" => unimplemented!(),
-
-                "jmp" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Jmp(value)), span)
-                }
                 "beq" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Beq(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Beq(label)), span)
                 }
                 "bne" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Bne(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Bne(label)), span)
                 }
                 "bhi" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Bhi(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Bhi(label)), span)
                 }
                 "bgt" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Bgt(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Bgt(label)), span)
                 }
                 "bhs" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Bhs(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Bhs(label)), span)
                 }
                 "bge" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Bge(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Bge(label)), span)
                 }
                 "blo" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Blo(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Blo(label)), span)
                 }
                 "blt" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Blt(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Blt(label)), span)
                 }
                 "bls" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Bls(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Bls(label)), span)
                 }
                 "ble" => {
-                    let Spanned { value, span } = self.parse_format_d()?;
-                    (MacroInstruction::Single(Instruction::Ble(value)), span)
+                    let Spanned { value: label, span } = self.consume_label()?;
+                    (Instruction::SymbolicForm(SymbolicForm::Ble(label)), span)
                 }
 
                 "lli" => {
-                    let Spanned { value, span } = self.parse_format_e()?;
-                    (MacroInstruction::Single(Instruction::Lli(value)), span)
+                    let Spanned { value, span } = self.parse_format_d_lli_lui(OPC_LLI)?;
+                    (Instruction::BinaryForm(BinaryForm::Lli(value)), span)
                 }
                 "lui" => {
-                    let Spanned { value, span } = self.parse_format_e()?;
-                    (MacroInstruction::Single(Instruction::Lui(value)), span)
+                    let Spanned { value, span } = self.parse_format_d_lli_lui(OPC_LUI)?;
+                    (Instruction::BinaryForm(BinaryForm::Lui(value)), span)
                 }
                 "adi" => {
-                    let Spanned { value, span } = self.parse_format_e()?;
-                    (MacroInstruction::Single(Instruction::Adi(value)), span)
+                    let Spanned { value, span } = self.parse_format_d_adi(OPC_ADI)?;
+                    (Instruction::BinaryForm(BinaryForm::Adi(value)), span)
                 }
 
                 "ldb" => {
-                    let Spanned { value, span } = self.parse_format_f_ld()?;
-                    (MacroInstruction::Single(Instruction::Ldb(value)), span)
+                    let Spanned { value, span } = self.parse_format_e_ld(OPC_LOD, LOD_FN_LDB)?;
+                    (Instruction::BinaryForm(BinaryForm::Ldb(value)), span)
                 }
                 "ldw" => {
-                    let Spanned { value, span } = self.parse_format_f_ld()?;
-                    (MacroInstruction::Single(Instruction::Ldw(value)), span)
+                    let Spanned { value, span } = self.parse_format_e_ld(OPC_LOD, LOD_FN_LDW)?;
+                    (Instruction::BinaryForm(BinaryForm::Ldw(value)), span)
                 }
                 "stb" => {
-                    let Spanned { value, span } = self.parse_format_f_st()?;
-                    (MacroInstruction::Single(Instruction::Stb(value)), span)
+                    let Spanned { value, span } = self.parse_format_e_st(OPC_STR, STR_FN_STB)?;
+                    (Instruction::BinaryForm(BinaryForm::Stb(value)), span)
                 }
                 "stw" => {
-                    let Spanned { value, span } = self.parse_format_f_st()?;
-                    (MacroInstruction::Single(Instruction::Stw(value)), span)
+                    let Spanned { value, span } = self.parse_format_e_st(OPC_STR, STR_FN_STW)?;
+                    (Instruction::BinaryForm(BinaryForm::Stw(value)), span)
                 }
 
                 // Pseudo instructions
+                "nop" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    (
+                        Instruction::BinaryForm(BinaryForm::add(GP_REG_0, GP_REG_0, GP_REG_0)),
+                        mnemonic_span.clone(),
+                    )
+                }
                 "lwi" => {
                     semantic.set(Some(Semantic::PseudoInstruction));
-                    let Spanned { value, span } = self.parse_pesudo_instruction_lwi()?;
-                    (value, span)
+
+                    let rd = self.consume_gp_register()?;
+
+                    self.consume_this(&dummy::COMMA, None)?;
+
+                    let imm = self.parse_integer::<u16, 16>()?;
+
+                    (
+                        Instruction::PseudoForm(PseudoForm::Lwi {
+                            rd: rd.value,
+                            imm: imm.value.as_u16(),
+                        }),
+                        rd.merge_span(&imm),
+                    )
+                }
+                "jmp" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    let Spanned { value: label, span } = self.consume_label()?;
+
+                    (Instruction::SymbolicForm(SymbolicForm::Jmp(label)), span)
+                }
+                "cal" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    let Spanned { value: label, span } = self.consume_label()?;
+
+                    (Instruction::SymbolicForm(SymbolicForm::Cal(label)), span)
+                }
+                "ret" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    (
+                        Instruction::PseudoForm(PseudoForm::Ret),
+                        mnemonic_span.clone(),
+                    )
                 }
 
                 _ => {
                     return Err(Spanned::new(
-                        Error::UnknownInstruction { name: value },
+                        Error::UnknownInstruction { name },
                         mnemonic_span,
                     ));
                 }
@@ -796,18 +1191,8 @@ impl<'t> Parser<'t> {
         if let Some(label) = self.expect_local_label() {
             let mut instructions = vec![];
             loop {
-                if let Some(instruction) = self.parse_macro_instruction()? {
-                    let span = instruction.span;
-                    match instruction.value {
-                        MacroInstruction::Single(instruction) => {
-                            instructions.push(Spanned::new(instruction, span));
-                        }
-                        MacroInstruction::Expanded(expanded) => {
-                            for instruction in expanded {
-                                instructions.push(Spanned::new(instruction, span.clone()));
-                            }
-                        }
-                    }
+                if let Some(instruction) = self.parse_instruction()? {
+                    instructions.push(instruction);
                 } else {
                     break;
                 }
@@ -826,18 +1211,8 @@ impl<'t> Parser<'t> {
         if let Some(label) = self.expect_global_label() {
             let mut instructions = vec![];
             loop {
-                if let Some(instruction) = self.parse_macro_instruction()? {
-                    let span = instruction.span;
-                    match instruction.value {
-                        MacroInstruction::Single(instruction) => {
-                            instructions.push(Spanned::new(instruction, span));
-                        }
-                        MacroInstruction::Expanded(expanded) => {
-                            for instruction in expanded {
-                                instructions.push(Spanned::new(instruction, span.clone()));
-                            }
-                        }
-                    }
+                if let Some(instruction) = self.parse_instruction()? {
+                    instructions.push(instruction)
                 } else {
                     break;
                 }
@@ -855,7 +1230,7 @@ impl<'t> Parser<'t> {
             return Ok(Some(GlobalBlock {
                 label,
                 instructions,
-                subblocks: blocks,
+                local_blocks: blocks,
             }));
         }
 
@@ -878,4 +1253,44 @@ impl<'t> Parser<'t> {
 
 pub fn parse(tokens: &[Cow<Spanned<SemanticToken>>]) -> Result<Vec<GlobalBlock>, Spanned<Error>> {
     Parser::new(tokens).parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{lexer, parser, preprocessor};
+    use indoc::indoc;
+
+    macro_rules! preprocess_str {
+        ($source:expr) => {
+            let original_tokens = lexer::tokenize(source).unwrap();
+            let preprocessed_tokens = preprocessor::preprocess(&original_tokens).unwrap();
+
+            preprocessed_tokens
+        };
+    }
+
+    fn parse_str(source: &str) -> Result<Vec<GlobalBlock>, Spanned<Error>> {
+        let original_tokens = lexer::tokenize(source).unwrap();
+        let preprocessed_tokens = preprocessor::preprocess(&original_tokens).unwrap();
+
+        parse(&preprocessed_tokens)
+    }
+
+    // #[test]
+    // fn use_unknown_local_label() {
+    //     assert_eq!(
+    //         parse_str(indoc! {"
+    //             _start:
+    //                 nop
+    //
+    //             .target_0:
+    //                 jmp .target_3
+    //
+    //             .target_1:
+    //                 nop
+    //         "}),
+    //         Spanned::new(Error::UnknownInstruction {}, Span::new(0, 0))
+    //     );
+    // }
 }

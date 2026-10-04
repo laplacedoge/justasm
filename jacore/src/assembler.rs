@@ -1,13 +1,19 @@
 use crate::Spanned;
-use crate::parser::{self, FormatA, FormatB, FormatC, FormatD, FormatE, FormatF, Instruction};
+use crate::parser::{
+    self, BinaryForm, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR, GlobalBlock, LocalBlock, PseudoForm,
+    SignedIntoChecked, SymbolicForm,
+};
 use bilge::prelude::*;
 use std::collections::HashMap;
+use std::hint::unreachable_unchecked;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
     DuplicatedLabel { label: String },
     UndefinedGlobalLabel { label: String },
     UndefinedLocalLabel { label: String },
+    AbsoluteBranchOutOfRange { label: String, address: usize },
+    RelativeBranchOutOfRange { label: String, offset: isize },
 }
 
 impl std::fmt::Display for Error {
@@ -22,481 +28,632 @@ impl std::fmt::Display for Error {
             Error::UndefinedLocalLabel { label } => {
                 write!(f, "Cannot find label '{}' in current scope", label)
             }
+            Error::AbsoluteBranchOutOfRange {
+                label,
+                address: offset,
+            } => {
+                write!(
+                    f,
+                    "Absolute branch target '{}' out of range ({})",
+                    label, offset
+                )
+            }
+            Error::RelativeBranchOutOfRange { label, offset } => {
+                write!(
+                    f,
+                    "Relative branch target '{}' out of range ({})",
+                    label, offset
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for Error {}
 
-#[bitsize(16)]
-#[derive(FromBits, DebugBits)]
-pub struct TypeA {
-    opc: u4,
-    fun: u3,
-    rs1: u3,
-    rs2: u3,
-    rd: u3,
+/// Maps labels to instruction offset of corresponding blocks (LOM stands for Label-Offset-Mapping)
+type LomTable = HashMap<String, usize>;
+
+fn lookup_label(
+    global_labels: &LomTable,
+    local_labels: &LomTable,
+    label: &str,
+) -> Result<usize, Error> {
+    if label.starts_with('.') {
+        local_labels.get(label).ok_or(Error::UndefinedLocalLabel {
+            label: label.to_owned(),
+        })
+    } else {
+        global_labels.get(label).ok_or(Error::UndefinedGlobalLabel {
+            label: label.to_owned(),
+        })
+    }
+    .map(|offset| offset.to_owned())
 }
 
-#[bitsize(16)]
-#[derive(FromBits, DebugBits)]
-pub struct TypeB {
-    opc: u4,
-    fun: u3,
-    off: u9,
+enum ImmediateLoadForm {
+    Direct([BinaryForm; 1]),
+    TwoStage([BinaryForm; 2]),
 }
 
-#[bitsize(16)]
-#[derive(FromBits, DebugBits)]
-pub struct TypeC {
-    opc: u4,
-    fun: u3,
-    off: u6,
-    rd: u3,
+impl ImmediateLoadForm {
+    fn new(rd: u3, imm: u16) -> Self {
+        if imm == 0 {
+            ImmediateLoadForm::Direct([BinaryForm::add(rd, GP_REG_0, GP_REG_0)])
+        } else if imm & 0b0000_0001_1111_1111 != 0 && imm & 0b1111_1110_0000_0000 == 0 {
+            ImmediateLoadForm::Direct([BinaryForm::lli(rd, u9::new(imm))])
+        } else if imm & 0b1111_1111_1000_0000 != 0 && imm & 0b0000_0000_0111_1111 == 0 {
+            ImmediateLoadForm::Direct([BinaryForm::lui(rd, u9::new(imm >> 7))])
+        } else {
+            ImmediateLoadForm::TwoStage([
+                BinaryForm::lui(rd, u9::new(imm >> 7)),
+                BinaryForm::adi(rd, u9::new(imm & 0b0000_0000_0111_1111)),
+            ])
+        }
+    }
+
+    fn as_slice(&self) -> &[BinaryForm] {
+        match self {
+            ImmediateLoadForm::Direct(a) => a.as_slice(),
+            ImmediateLoadForm::TwoStage(a) => a.as_slice(),
+        }
+    }
 }
 
-#[bitsize(16)]
-#[derive(FromBits, DebugBits)]
-pub struct TypeD {
-    opc: u4,
-    fun: u2,
-    off: u10,
+#[derive(Debug, Clone, Copy)]
+enum ExpandedForm {
+    OneInstruction([BinaryForm; 1]),
+    TwoInstructions([BinaryForm; 2]),
+    ThreeInstructions([BinaryForm; 3]),
 }
 
-#[bitsize(16)]
-#[derive(FromBits, DebugBits)]
-pub struct TypeE {
-    opc: u4,
-    imm: u9,
-    rd: u3,
-}
+impl ExpandedForm {
+    fn as_slice(&self) -> &[BinaryForm] {
+        match self {
+            ExpandedForm::OneInstruction(i) => i.as_slice(),
+            ExpandedForm::TwoInstructions(i) => i.as_slice(),
+            ExpandedForm::ThreeInstructions(i) => i.as_slice(),
+        }
+    }
 
-#[bitsize(16)]
-#[derive(FromBits, DebugBits)]
-pub struct TypeF {
-    opc: u4,
-    fun: u1,
-    off: u5,
-    rs: u3,
-    rd: u3,
-}
-
-const OPC_BIN: u8 = 0b0000;
-const BIN_FN_ADD: u8 = 0b000;
-const BIN_FN_SUB: u8 = 0b001;
-const BIN_FN_NOR: u8 = 0b010;
-const BIN_FN_AND: u8 = 0b011;
-const BIN_FN_XOR: u8 = 0b100;
-const BIN_FN_LSL: u8 = 0b101;
-const BIN_FN_LSR: u8 = 0b110;
-const BIN_FN_ASR: u8 = 0b111;
-
-const OPC_JP0: u8 = 0b0001;
-const JP0_FN_JLP: u8 = 0b000;
-
-#[allow(dead_code)]
-const JP0_FN_JLR: u8 = 0b101;
-const JP0_FN_JMP: u8 = 0b01;
-const JP0_FN_BEQ: u8 = 0b10;
-const JP0_FN_BNE: u8 = 0b11;
-
-const OPC_JP1: u8 = 0b0010;
-const JP1_FN_BHI: u8 = 0b00;
-const JP1_FN_BGT: u8 = 0b01;
-const JP1_FN_BHS: u8 = 0b10;
-const JP1_FN_BGE: u8 = 0b11;
-
-const OPC_JP2: u8 = 0b0011;
-const JP2_FN_BLO: u8 = 0b00;
-const JP2_FN_BLT: u8 = 0b01;
-const JP2_FN_BLS: u8 = 0b10;
-const JP2_FN_BLE: u8 = 0b11;
-
-const OPC_LLI: u8 = 0b0100;
-const OPC_LUI: u8 = 0b0101;
-const OPC_ADI: u8 = 0b0110;
-
-const OPC_LOD: u8 = 0b0111;
-const LOD_FN_LDB: u8 = 0b0;
-const LOD_FN_LDW: u8 = 0b1;
-
-const OPC_STR: u8 = 0b1000;
-const STR_FN_STB: u8 = 0b0;
-const STR_FN_STW: u8 = 0b1;
-
-#[derive(Debug)]
-pub struct LocalContext<'b> {
-    /// References to the instructions belonging to this local block.
-    instructions: &'b [Spanned<Instruction>],
+    fn instruction_count(&self) -> usize {
+        self.as_slice().len()
+    }
 }
 
 #[derive(Debug)]
-pub struct GlobalContext<'b> {
-    /// References to the instructions belonging to this global block.
-    instructions: &'b [Spanned<Instruction>],
+struct DynamicForm {
+    symbolic_form: SymbolicForm,
+    expanded_form: ExpandedForm,
+    expanded_count: u8,
+}
+
+impl DynamicForm {
+    fn from_symbolic_form(symbolic_form: &SymbolicForm) -> Self {
+        let dummy_expanded = ExpandedForm::OneInstruction([BinaryForm::jpp(i11::new(0))]);
+        DynamicForm {
+            symbolic_form: symbolic_form.to_owned(),
+            expanded_form: dummy_expanded,
+            expanded_count: dummy_expanded.instruction_count() as u8,
+        }
+    }
+
+    fn instruction_count(&self) -> usize {
+        self.expanded_form.instruction_count()
+    }
+
+    fn expand_again(
+        &mut self,
+        globals: &LomTable,
+        locals: &LomTable,
+        offset: usize,
+    ) -> Result<bool, Error> {
+        let expanded_form = match &self.symbolic_form {
+            SymbolicForm::Jmp(label) => {
+                let target_addr = lookup_label(globals, locals, label)?;
+                let new_offset = target_addr as isize - offset as isize;
+                if let Some(offset) = new_offset.into_checked() {
+                    ExpandedForm::OneInstruction([BinaryForm::jpp(offset)])
+                } else {
+                    let suffix = BinaryForm::jpr(GP_REG_JUMP_ASSIST, i8::new(0));
+                    match ImmediateLoadForm::new(
+                        GP_REG_JUMP_ASSIST,
+                        target_addr
+                            .try_into()
+                            .map_err(|_| Error::AbsoluteBranchOutOfRange {
+                                label: label.to_owned(),
+                                address: target_addr,
+                            })?,
+                    ) {
+                        ImmediateLoadForm::Direct(a) => {
+                            ExpandedForm::TwoInstructions([a[0], suffix])
+                        }
+                        ImmediateLoadForm::TwoStage(a) => {
+                            ExpandedForm::ThreeInstructions([a[0], a[1], suffix])
+                        }
+                    }
+                }
+            }
+            SymbolicForm::Cal(label) => {
+                let target_addr = lookup_label(globals, locals, label)?;
+                let new_offset = target_addr as isize - offset as isize;
+                if let Some(offset) = new_offset.into_checked() {
+                    ExpandedForm::OneInstruction([BinaryForm::jlp(offset)])
+                } else {
+                    let suffix = BinaryForm::jlr(GP_REG_JUMP_ASSIST, i8::new(0));
+                    match ImmediateLoadForm::new(
+                        GP_REG_JUMP_ASSIST,
+                        target_addr
+                            .try_into()
+                            .map_err(|_| Error::AbsoluteBranchOutOfRange {
+                                label: label.to_owned(),
+                                address: target_addr,
+                            })?,
+                    ) {
+                        ImmediateLoadForm::Direct(a) => {
+                            ExpandedForm::TwoInstructions([a[0], suffix])
+                        }
+                        ImmediateLoadForm::TwoStage(a) => {
+                            ExpandedForm::ThreeInstructions([a[0], a[1], suffix])
+                        }
+                    }
+                }
+            }
+            _ => {
+                let (new_binary_form, label): (fn(i11) -> BinaryForm, &str) =
+                    match &self.symbolic_form {
+                        SymbolicForm::Beq(l) => (BinaryForm::beq, l),
+                        SymbolicForm::Bne(l) => (BinaryForm::bne, l),
+                        SymbolicForm::Bhi(l) => (BinaryForm::bhi, l),
+                        SymbolicForm::Bgt(l) => (BinaryForm::bgt, l),
+                        SymbolicForm::Bhs(l) => (BinaryForm::bhs, l),
+                        SymbolicForm::Bge(l) => (BinaryForm::bge, l),
+                        SymbolicForm::Blo(l) => (BinaryForm::blo, l),
+                        SymbolicForm::Blt(l) => (BinaryForm::blt, l),
+                        SymbolicForm::Bls(l) => (BinaryForm::bls, l),
+                        SymbolicForm::Ble(l) => (BinaryForm::ble, l),
+                        _ => unsafe { unreachable_unchecked() },
+                    };
+                let new_offset = lookup_label(globals, locals, label)? as isize - offset as isize;
+                let binary_form = new_binary_form(new_offset.into_checked().ok_or(
+                    Error::RelativeBranchOutOfRange {
+                        label: label.to_owned(),
+                        offset: new_offset,
+                    },
+                )?);
+                ExpandedForm::OneInstruction([binary_form])
+            }
+        };
+
+        let old_count = self.expanded_count as usize;
+        let new_count = expanded_form.instruction_count();
+        self.expanded_form = expanded_form;
+        self.expanded_count = new_count as u8;
+
+        Ok(new_count != old_count)
+    }
+}
+
+#[derive(Debug)]
+enum Instruction {
+    BinaryForm(BinaryForm),
+    PendingForm(Box<DynamicForm>),
+}
+
+impl Instruction {
+    fn instruction_count(&self) -> usize {
+        match self {
+            Instruction::BinaryForm(_) => 1,
+            Instruction::PendingForm(f) => f.instruction_count(),
+        }
+    }
+
+    fn encode_into(&self, buffer: &mut Vec<u8>) {
+        for f in match self {
+            Instruction::BinaryForm(f) => std::slice::from_ref(f),
+            Instruction::PendingForm(f) => f.expanded_form.as_slice(),
+        } {
+            buffer.extend(f.value().to_le_bytes());
+        }
+    }
+}
+
+fn include_label(
+    lom: &mut LomTable,
+    label: &Spanned<String>,
+    offset: usize,
+) -> Result<(), Spanned<Error>> {
+    let value = label.value.clone();
+    if lom.contains_key(&value) {
+        return Err(Spanned::new(
+            Error::DuplicatedLabel {
+                label: label.value.clone(),
+            },
+            label.span.clone(),
+        ));
+    } else {
+        lom.insert(value, offset);
+    }
+
+    Ok(())
+}
+
+fn transform_instructions(
+    instructions: &[Spanned<parser::Instruction>],
+) -> Vec<Spanned<Instruction>> {
+    let mut output = Vec::with_capacity(instructions.len());
+    for Spanned {
+        value: instruction,
+        span,
+    } in instructions
+    {
+        match instruction {
+            parser::Instruction::BinaryForm(f) => {
+                output.push(Spanned::new(
+                    Instruction::BinaryForm(f.to_owned()),
+                    span.to_owned(),
+                ));
+            }
+            parser::Instruction::SymbolicForm(f) => {
+                output.push(Spanned::new(
+                    Instruction::PendingForm(Box::new(DynamicForm::from_symbolic_form(f))),
+                    span.to_owned(),
+                ));
+            }
+            parser::Instruction::PseudoForm(f) => match f {
+                PseudoForm::Lwi { rd, imm } => {
+                    for binary_form in
+                        ImmediateLoadForm::new(rd.to_owned(), imm.to_owned()).as_slice()
+                    {
+                        output.push(Spanned::new(
+                            Instruction::BinaryForm(binary_form.to_owned()),
+                            span.to_owned(),
+                        ));
+                    }
+                }
+                PseudoForm::Ret => {
+                    output.push(Spanned::new(
+                        Instruction::BinaryForm(BinaryForm::jpr(GP_REG_LR, 0)),
+                        span.to_owned(),
+                    ));
+                }
+            },
+        }
+    }
+
+    output
+}
+
+#[derive(Debug)]
+pub struct LocalContext {
+    label: Spanned<String>,
+
+    /// Instructions belonging to this local block.
+    instructions: Vec<Spanned<Instruction>>,
+}
+
+impl LocalContext {
+    fn from_local_block(
+        block: &LocalBlock,
+        lom: &mut LomTable,
+        offset: &mut usize,
+    ) -> Result<LocalContext, Spanned<Error>> {
+        // Saves local label and its initial offset to LOM table
+        let base = *offset;
+        include_label(lom, &block.label, base)?;
+
+        // Transforms instructions and updates offset
+        let instructions = transform_instructions(&block.instructions);
+        let count = instructions
+            .iter()
+            .map(|i| i.value.instruction_count())
+            .sum::<usize>();
+        *offset += count;
+
+        Ok(Self {
+            label: block.label.clone(),
+            instructions,
+        })
+    }
+
+    fn resolve_branch_relaxation_recursively(
+        &mut self,
+        globals: &LomTable,
+        locals: &LomTable,
+        offset: &mut usize,
+    ) -> Result<bool, Spanned<Error>> {
+        let mut current = *offset;
+        let mut resized = false;
+
+        for Spanned {
+            value: instruction,
+            span,
+        } in &mut self.instructions
+        {
+            current += match instruction {
+                Instruction::BinaryForm(_) => 1,
+                Instruction::PendingForm(f) => {
+                    if f.expand_again(globals, locals, current)
+                        .map_err(|e| Spanned::new(e, span.to_owned()))?
+                    {
+                        resized = true;
+                    }
+
+                    f.instruction_count()
+                }
+            };
+        }
+
+        *offset = current;
+
+        Ok(resized)
+    }
+
+    fn encode_into(&self, buffer: &mut Vec<u8>) {
+        self.instructions
+            .iter()
+            .for_each(|i| i.value.encode_into(buffer));
+    }
+
+    #[allow(dead_code)]
+    fn print(&self) {
+        println!("{}:", self.label.value);
+        self.instructions
+            .iter()
+            .map(|Spanned { value: i, .. }| match i {
+                Instruction::BinaryForm(f) => std::slice::from_ref(f),
+                Instruction::PendingForm(f) => f.expanded_form.as_slice(),
+            })
+            .flat_map(|a| a.iter())
+            .for_each(|f| println!("    {}", f));
+    }
+}
+
+#[derive(Debug)]
+pub struct GlobalContext {
+    label: Spanned<String>,
+
+    /// Instructions belonging to this global block.
+    instructions: Vec<Spanned<Instruction>>,
 
     /// Local contexts belonging to this global context.
-    local_contexts: Vec<LocalContext<'b>>,
+    local_contexts: Vec<LocalContext>,
 
     /// Maps local labels to their corresponding offsets.
-    label_indices: HashMap<String, usize>,
+    local_lom: LomTable,
+}
+
+impl GlobalContext {
+    fn from_global_block(
+        block: &GlobalBlock,
+        lom: &mut LomTable,
+        offset: &mut usize,
+    ) -> Result<GlobalContext, Spanned<Error>> {
+        // Saves local label and its initial offset to LOM table
+        let base = *offset;
+        include_label(lom, &block.label, base)?;
+
+        // Transforms instructions and updates offset
+        let instructions = transform_instructions(&block.instructions);
+        let count = instructions
+            .iter()
+            .map(|i| i.value.instruction_count())
+            .sum::<usize>();
+        *offset += count;
+
+        // Inspects all the local blocks under the current global block
+        let mut local_contexts = vec![];
+        let mut local_lom = LomTable::new();
+        for local_block in &block.local_blocks {
+            let context = LocalContext::from_local_block(local_block, &mut local_lom, offset)?;
+            local_contexts.push(context);
+        }
+
+        Ok(Self {
+            label: block.label.clone(),
+            instructions,
+            local_contexts,
+            local_lom,
+        })
+    }
+
+    fn resolve_branch_relaxation_recursively(
+        &mut self,
+        globals: &LomTable,
+        offset: &mut usize,
+    ) -> Result<bool, Spanned<Error>> {
+        let mut current = *offset;
+        let mut resized = false;
+
+        for Spanned {
+            value: instruction,
+            span,
+        } in &mut self.instructions
+        {
+            current += match instruction {
+                Instruction::BinaryForm(_) => 1,
+                Instruction::PendingForm(f) => {
+                    if f.expand_again(globals, &self.local_lom, current)
+                        .map_err(|e| Spanned::new(e, span.to_owned()))?
+                    {
+                        resized = true;
+                    }
+
+                    f.instruction_count()
+                }
+            };
+        }
+
+        *offset = current;
+
+        for context in &mut self.local_contexts {
+            let label = context.label.value.to_owned();
+            self.local_lom.insert(label, *offset);
+            if context.resolve_branch_relaxation_recursively(globals, &self.local_lom, offset)? {
+                resized = true;
+            };
+        }
+
+        Ok(resized)
+    }
+
+    fn encode_into(&self, buffer: &mut Vec<u8>) {
+        self.instructions
+            .iter()
+            .for_each(|i| i.value.encode_into(buffer));
+        self.local_contexts
+            .iter()
+            .for_each(|c| c.encode_into(buffer));
+    }
+
+    #[allow(dead_code)]
+    fn print(&self) {
+        println!("{}:", self.label.value);
+        self.instructions
+            .iter()
+            .map(|Spanned { value: i, .. }| match i {
+                Instruction::BinaryForm(f) => std::slice::from_ref(f),
+                Instruction::PendingForm(f) => f.expanded_form.as_slice(),
+            })
+            .flat_map(|a| a.iter())
+            .for_each(|f| println!("    {}", f));
+        self.local_contexts.iter().for_each(|c| c.print());
+    }
 }
 
 #[derive(Debug)]
-pub struct SourceContext<'b> {
+pub struct SourceContext {
     /// Global contexts belonging to this source text.
-    global_contexts: Vec<GlobalContext<'b>>,
+    global_contexts: Vec<GlobalContext>,
 
     /// Maps global labels to their corresponding offsets.
-    label_indices: HashMap<String, usize>,
+    global_lom: LomTable,
 }
 
-struct Assembler {
-    instruction_original_position: usize,
-    instruction_offset: usize,
-    blob: Vec<u8>,
-}
+impl SourceContext {
+    fn from_global_blocks(blocks: &[GlobalBlock]) -> Result<SourceContext, Spanned<Error>> {
+        let mut offset = 0;
 
-impl<'b> Assembler {
-    fn new() -> Self {
-        Assembler {
-            instruction_original_position: 0,
-            instruction_offset: 0,
-            blob: vec![],
-        }
-    }
-
-    fn lookup_label(
-        &self,
-        label: &str,
-        global_labels: &HashMap<String, usize>,
-        local_labels: &HashMap<String, usize>,
-    ) -> Result<usize, Error> {
-        if label.starts_with('.') {
-            local_labels.get(label).ok_or(Error::UndefinedLocalLabel {
-                label: label.to_owned(),
-            })
-        } else {
-            global_labels.get(label).ok_or(Error::UndefinedGlobalLabel {
-                label: label.to_owned(),
-            })
-        }
-        .map(|offset| *offset)
-    }
-
-    fn assemble_format_a(&mut self, fmt: &FormatA, opc: u8, fun: u8) {
-        let instruction: u16 = TypeA::new(
-            u4::new(opc),
-            u3::new(fun),
-            u3::new(fmt.rs1.as_u8()),
-            u3::new(fmt.rs2.as_u8()),
-            u3::new(fmt.rd.as_u8()),
-        )
-        .into();
-        let bytes = instruction.to_le_bytes();
-        self.blob.extend_from_slice(&bytes);
-        self.instruction_offset += 1;
-    }
-
-    fn assemble_format_b(
-        &mut self,
-        fmt: &FormatB,
-        opc: u8,
-        fun: u8,
-        global_labels: &HashMap<String, usize>,
-        local_labels: &HashMap<String, usize>,
-    ) -> Result<(), Error> {
-        let offset = self.lookup_label(&fmt.label, global_labels, local_labels)? as isize
-            - self.instruction_offset as isize;
-        let instruction: u16 = TypeB::new(
-            u4::new(opc),
-            u3::new(fun),
-            u9::new(offset as u16 & 0b0000000111111111),
-        )
-        .into();
-        let bytes = instruction.to_le_bytes();
-        self.blob.extend_from_slice(&bytes);
-        self.instruction_offset += 1;
-        Ok(())
-    }
-
-    fn assemble_format_c(
-        &mut self,
-        fmt: &FormatC,
-        opc: u8,
-        fun: u8,
-        global_labels: &HashMap<String, usize>,
-        local_labels: &HashMap<String, usize>,
-    ) -> Result<(), Error> {
-        let offset = self.lookup_label(&fmt.label, global_labels, local_labels)? as isize
-            - self.instruction_offset as isize;
-        let instruction: u16 = TypeC::new(
-            u4::new(opc),
-            u3::new(fun),
-            u6::new(offset as u8),
-            u3::new(fmt.rd.as_u8()),
-        )
-        .into();
-        let bytes = instruction.to_le_bytes();
-        self.blob.extend_from_slice(&bytes);
-        self.instruction_offset += 1;
-        Ok(())
-    }
-
-    fn assemble_format_d(
-        &mut self,
-        fmt: &FormatD,
-        opc: u8,
-        fun: u8,
-        global_labels: &HashMap<String, usize>,
-        local_labels: &HashMap<String, usize>,
-    ) -> Result<(), Error> {
-        let offset = self.lookup_label(&fmt.label, global_labels, local_labels)? as isize
-            - self.instruction_offset as isize;
-        let instruction: u16 = TypeD::new(
-            u4::new(opc),
-            u2::new(fun),
-            u10::new(offset as u16 & 0b0000001111111111),
-        )
-        .into();
-        let bytes = instruction.to_le_bytes();
-        self.blob.extend_from_slice(&bytes);
-        self.instruction_offset += 1;
-        Ok(())
-    }
-
-    fn assemble_format_e(&mut self, fmt: &FormatE, opc: u8) {
-        let instruction: u16 = TypeE::new(
-            u4::new(opc),
-            u9::new(fmt.imm.as_u16()),
-            u3::new(fmt.rd.as_u8()),
-        )
-        .into();
-        let bytes = instruction.to_le_bytes();
-        self.blob.extend_from_slice(&bytes);
-        self.instruction_offset += 1;
-    }
-
-    fn assemble_format_f(&mut self, fmt: &FormatF, opc: u8, fun: u8) {
-        let instruction: u16 = TypeF::new(
-            u4::new(opc),
-            u1::new(fun),
-            u5::new(fmt.off.as_u8()),
-            u3::new(fmt.rs.as_u8()),
-            u3::new(fmt.rd.as_u8()),
-        )
-        .into();
-        let bytes = instruction.to_le_bytes();
-        self.blob.extend_from_slice(&bytes);
-        self.instruction_offset += 1;
-    }
-
-    fn include_label(
-        indices: &mut HashMap<String, usize>,
-        label: &Spanned<String>,
-        offset: usize,
-    ) -> Result<(), Spanned<Error>> {
-        let value = label.value.clone();
-        if indices.contains_key(&value) {
-            return Err(Spanned::new(
-                Error::DuplicatedLabel {
-                    label: label.value.clone(),
-                },
-                label.span.clone(),
-            ));
-        } else {
-            indices.insert(value, offset);
-        }
-
-        Ok(())
-    }
-
-    fn inspect_local_block(
-        &self,
-        local_block: &'b parser::LocalBlock,
-        local_indices: &mut HashMap<String, usize>,
-        binary_offset: &mut usize,
-    ) -> Result<LocalContext<'b>, Spanned<Error>> {
-        let base = *binary_offset;
-        Self::include_label(local_indices, &local_block.label, base)?;
-        *binary_offset += local_block.instructions.len();
-
-        Ok(LocalContext {
-            instructions: &local_block.instructions,
-        })
-    }
-
-    fn inspect_global_block(
-        &self,
-        global_block: &'b parser::GlobalBlock,
-        global_indices: &mut HashMap<String, usize>,
-        binary_offset: &mut usize,
-    ) -> Result<GlobalContext<'b>, Spanned<Error>> {
-        let base = *binary_offset;
-        Self::include_label(global_indices, &global_block.label, base)?;
-        *binary_offset += global_block.instructions.len();
-
-        let mut local_blocks = vec![];
-        let mut label_indices = HashMap::new();
-        for local_block in &global_block.subblocks {
-            local_blocks.push(self.inspect_local_block(
-                local_block,
-                &mut label_indices,
-                binary_offset,
-            )?);
-        }
-
-        Ok(GlobalContext {
-            instructions: &global_block.instructions,
-            local_contexts: local_blocks,
-            label_indices,
-        })
-    }
-
-    fn inspect_source(
-        &mut self,
-        global_blocks: &'b [parser::GlobalBlock],
-    ) -> Result<SourceContext<'b>, Spanned<Error>> {
-        let mut binary_offset = 0;
-
-        let mut blocks = vec![];
-        let mut indices = HashMap::new();
-        for global_block in global_blocks {
-            blocks.push(self.inspect_global_block(
-                global_block,
-                &mut indices,
-                &mut binary_offset,
+        let mut contexts = vec![];
+        let mut lom = LomTable::new();
+        for block in blocks {
+            contexts.push(GlobalContext::from_global_block(
+                block,
+                &mut lom,
+                &mut offset,
             )?);
         }
 
         Ok(SourceContext {
-            global_contexts: blocks,
-            label_indices: indices,
+            global_contexts: contexts,
+            global_lom: lom,
         })
     }
 
-    fn assemble_instruction(
-        &mut self,
-        instruction: &Spanned<Instruction>,
-        global_labels: &HashMap<String, usize>,
-        local_labels: &HashMap<String, usize>,
-    ) -> Result<(), Spanned<Error>> {
-        match &instruction.value {
-            Instruction::Add(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_ADD),
-            Instruction::Sub(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_SUB),
-            Instruction::Nor(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_NOR),
-            Instruction::And(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_AND),
-            Instruction::Xor(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_XOR),
-            Instruction::Lsl(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_LSL),
-            Instruction::Lsr(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_LSR),
-            Instruction::Asr(f) => self.assemble_format_a(f, OPC_BIN, BIN_FN_ASR),
+    fn resolve_branch_relaxation_recursively(&mut self) -> Result<bool, Spanned<Error>> {
+        let mut offset = 0;
+        let mut resized = false;
 
-            Instruction::Jlp(f) => self
-                .assemble_format_b(f, OPC_JP0, JP0_FN_JLP, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            // Instruction::Jlr(f) => self.compile_format_c(f, OPC_JP0, JP0_FN_JLR)?,
-            Instruction::Jlr(_) => unimplemented!(),
-            Instruction::Jmp(f) => self
-                .assemble_format_d(f, OPC_JP0, JP0_FN_JMP, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Beq(f) => self
-                .assemble_format_d(f, OPC_JP0, JP0_FN_BEQ, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Bne(f) => self
-                .assemble_format_d(f, OPC_JP0, JP0_FN_BNE, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
+        for context in &mut self.global_contexts {
+            let label = context.label.value.to_owned();
+            self.global_lom.insert(label, offset);
+            if context.resolve_branch_relaxation_recursively(&self.global_lom, &mut offset)? {
+                resized = true;
+            }
+        }
 
-            Instruction::Bhi(f) => self
-                .assemble_format_d(f, OPC_JP1, JP1_FN_BHI, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Bgt(f) => self
-                .assemble_format_d(f, OPC_JP1, JP1_FN_BGT, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Bhs(f) => self
-                .assemble_format_d(f, OPC_JP1, JP1_FN_BHS, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Bge(f) => self
-                .assemble_format_d(f, OPC_JP1, JP1_FN_BGE, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
+        Ok(resized)
+    }
 
-            Instruction::Blo(f) => self
-                .assemble_format_d(f, OPC_JP2, JP2_FN_BLO, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Blt(f) => self
-                .assemble_format_d(f, OPC_JP2, JP2_FN_BLT, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Bls(f) => self
-                .assemble_format_d(f, OPC_JP2, JP2_FN_BLS, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-            Instruction::Ble(f) => self
-                .assemble_format_d(f, OPC_JP2, JP2_FN_BLE, global_labels, local_labels)
-                .map_err(|e| Spanned::new(e, instruction.span.clone()))?,
-
-            Instruction::Lli(f) => self.assemble_format_e(f, OPC_LLI),
-            Instruction::Lui(f) => self.assemble_format_e(f, OPC_LUI),
-            Instruction::Adi(f) => self.assemble_format_e(f, OPC_ADI),
-
-            Instruction::Ldb(f) => self.assemble_format_f(f, OPC_LOD, LOD_FN_LDB),
-            Instruction::Ldw(f) => self.assemble_format_f(f, OPC_LOD, LOD_FN_LDW),
-            Instruction::Stb(f) => self.assemble_format_f(f, OPC_STR, STR_FN_STB),
-            Instruction::Stw(f) => self.assemble_format_f(f, OPC_STR, STR_FN_STW),
+    fn resolve_branch_relaxation(&mut self) -> Result<(), Spanned<Error>> {
+        loop {
+            if !self.resolve_branch_relaxation_recursively()? {
+                break;
+            }
         }
 
         Ok(())
     }
 
-    fn assemble_local_context(
-        &mut self,
-        local_context: &LocalContext,
-        global_labels: &HashMap<String, usize>,
-        local_labels: &HashMap<String, usize>,
-    ) -> Result<(), Spanned<Error>> {
-        for instruction in local_context.instructions {
-            self.assemble_instruction(instruction, global_labels, local_labels)?;
-        }
-
-        Ok(())
+    fn encode_into(&self, buffer: &mut Vec<u8>) {
+        self.global_contexts
+            .iter()
+            .for_each(|c| c.encode_into(buffer));
     }
 
-    fn assemble_global_context(
-        &mut self,
-        global_context: &GlobalContext,
-        global_labels: &HashMap<String, usize>,
-    ) -> Result<(), Spanned<Error>> {
-        let local_labels = &global_context.label_indices;
-        for instruction in global_context.instructions {
-            self.assemble_instruction(instruction, global_labels, local_labels)?;
-        }
-
-        for local_context in &global_context.local_contexts {
-            self.assemble_local_context(local_context, global_labels, local_labels)?;
-        }
-
-        Ok(())
-    }
-
-    fn assemble_source_context(
-        &mut self,
-        source_context: &SourceContext,
-    ) -> Result<(), Spanned<Error>> {
-        for global_context in &source_context.global_contexts {
-            self.assemble_global_context(global_context, &source_context.label_indices)?;
-        }
-
-        Ok(())
-    }
-
-    fn assemble(
-        &mut self,
-        global_blocks: &'b [parser::GlobalBlock],
-    ) -> Result<Vec<u8>, Spanned<Error>> {
-        let source_context = self.inspect_source(global_blocks)?;
-        self.assemble_source_context(&source_context)?;
-
-        Ok(std::mem::take(&mut self.blob))
+    #[allow(dead_code)]
+    fn print(&self) {
+        self.global_contexts.iter().for_each(|c| c.print());
     }
 }
 
-pub fn assemble(blocks: &[parser::GlobalBlock]) -> Result<Vec<u8>, Spanned<Error>> {
-    Assembler::new().assemble(blocks)
+pub fn assemble(blocks: &[GlobalBlock]) -> Result<Vec<u8>, Spanned<Error>> {
+    let mut context = SourceContext::from_global_blocks(blocks)?;
+
+    context.resolve_branch_relaxation()?;
+
+    let mut buffer = vec![];
+    context.encode_into(&mut buffer);
+
+    // context.print();
+
+    Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Span, lexer, preprocessor};
+    use indoc::indoc;
+
+    fn assemble_str(source: &str) -> Result<Vec<u8>, Spanned<Error>> {
+        let original_tokens = lexer::tokenize(source).unwrap();
+        let preprocessed_tokens = preprocessor::preprocess(&original_tokens).unwrap();
+        let global_blocks = parser::parse(&preprocessed_tokens).unwrap();
+
+        assemble(&global_blocks)
+    }
+
+    #[test]
+    fn use_undefined_label() {
+        // Use undefined local label
+        assert_eq!(
+            assemble_str(indoc! {"
+                _start:
+                    nop
+
+                .target_0:
+                    jmp .target_3
+
+                .target_1:
+                    nop
+            "}),
+            Err(Spanned::new(
+                Error::UndefinedLocalLabel {
+                    label: ".target_3".into(),
+                },
+                Span::new(32, 13)
+            ),)
+        );
+
+        // Use undefined global label
+        assert_eq!(
+            assemble_str(indoc! {"
+                _start:
+                    nop
+
+                .target_0:
+                    jmp .target_1
+
+                .target_1:
+                    jmp _end
+            "}),
+            Err(Spanned::new(
+                Error::UndefinedGlobalLabel {
+                    label: "_end".into(),
+                },
+                Span::new(62, 8)
+            ),)
+        );
+    }
 }
