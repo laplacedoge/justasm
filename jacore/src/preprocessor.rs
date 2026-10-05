@@ -1,5 +1,8 @@
 use crate::lexer::{Semantic, SemanticToken, Token, dummy};
-use crate::{Span, Spanned, format_unexpected_token_error, get_source_len_from_tokens};
+use crate::{
+    Span, Spanned, UnsignedStorageInteger, format_unexpected_token_error,
+    get_source_len_from_tokens,
+};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -32,7 +35,7 @@ impl std::error::Error for Error {}
 
 enum Replaceable {
     Name(String),
-    Integer(usize),
+    Integer(UnsignedStorageInteger),
 }
 
 struct Preprocessor<'s> {

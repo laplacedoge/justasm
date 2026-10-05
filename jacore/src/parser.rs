@@ -1,7 +1,11 @@
 use crate::lexer::{Semantic, SemanticToken, Token, dummy};
-use crate::{Span, Spanned, format_unexpected_token_error};
+use crate::{
+    SignedStorageInteger, Span, Spanned, UnsignedStorageInteger, format_unexpected_token_error,
+};
 use bilge::prelude::*;
+use num_traits::AsPrimitive;
 use std::borrow::Cow;
+use std::ops::{Neg, Range};
 
 #[derive(Debug)]
 pub enum Error {
@@ -19,8 +23,9 @@ pub enum Error {
     UnknownGpRegister {
         name: String,
     },
-    IntegerOverflow {
-        value: Option<isize>,
+    IntegerLiteralOutOfRange {
+        range: Range<i64>,
+        value: i64,
     },
 }
 
@@ -30,6 +35,10 @@ impl Error {
             unexpected,
             expected,
         }
+    }
+
+    fn integer_literal_out_of_range(range: Range<i64>, value: i64) -> Self {
+        Error::IntegerLiteralOutOfRange { range, value }
     }
 }
 
@@ -52,10 +61,13 @@ impl std::fmt::Display for Error {
             Error::UnknownGpRegister { name } => {
                 write!(f, "Unknown general purpose register '{}'", name)
             }
-            Error::IntegerOverflow { value } => match value {
-                Some(value) => write!(f, "Integer '{}' overflows", value),
-                None => write!(f, "Integer overflow"),
-            },
+            Error::IntegerLiteralOutOfRange { range, value } => {
+                write!(
+                    f,
+                    "Integer literal '{}' is out of the range of [{}, {}]",
+                    value, range.start, range.end
+                )
+            }
         }
     }
 }
@@ -126,75 +138,60 @@ pub const GP_REG_SP: u3 = u3::new(6);
 pub const GP_REG_LR: u3 = u3::new(7);
 pub const GP_REG_JUMP_ASSIST: u3 = u3::new(5);
 
-pub trait UnsignedIntoChecked<T> {
-    const MAX: usize;
-    fn into_checked(self) -> Option<T>;
+pub struct CastingError {
+    range: Range<i64>,
+    value: i64,
 }
 
-impl<const BITS: usize> UnsignedIntoChecked<UInt<u8, BITS>> for usize {
-    const MAX: usize = (1 << BITS) - 1;
-    fn into_checked(self) -> Option<UInt<u8, BITS>> {
-        if self > <Self as UnsignedIntoChecked<UInt<u8, BITS>>>::MAX {
-            None
-        } else {
-            Some(unsafe { UInt::<u8, BITS>::new_unchecked(self as u8) })
+pub trait CheckedCasting<T> {
+    fn cast_checked(self) -> Result<T, CastingError>;
+}
+
+impl<A, const BITS: usize> CheckedCasting<UInt<A, BITS>> for UnsignedStorageInteger
+where
+    A: 'static + BuiltinInteger + UnsignedInteger,
+    UInt<A, BITS>: Integer<UnderlyingType = A>,
+    Self: AsPrimitive<A>,
+{
+    fn cast_checked(self) -> Result<UInt<A, BITS>, CastingError> {
+        if <UInt<A, BITS> as Integer>::MAX.as_u64() >= self.as_u64() {
+            if let Ok(value) = <UInt<A, BITS> as Integer>::try_new(AsPrimitive::as_(self)) {
+                return Ok(value);
+            }
         }
+
+        Err(CastingError {
+            value: self.as_i64(),
+            range: Range {
+                start: 0,
+                end: <UInt<A, BITS> as Integer>::MAX.as_i64(),
+            },
+        })
     }
 }
 
-impl<const BITS: usize> UnsignedIntoChecked<UInt<u16, BITS>> for usize {
-    const MAX: usize = (1 << BITS) - 1;
-    fn into_checked(self) -> Option<UInt<u16, BITS>> {
-        if self > <Self as UnsignedIntoChecked<UInt<u16, BITS>>>::MAX {
-            None
-        } else {
-            Some(unsafe { UInt::<u16, BITS>::new_unchecked(self as u16) })
-        }
-    }
-}
-
-pub trait SignedIntoChecked<T> {
-    const MASK: usize;
-    const MIN: isize;
-    const MAX: isize;
-    fn into_checked(self) -> Option<T>;
-}
-
-impl<const BITS: usize> SignedIntoChecked<Int<i8, BITS>> for isize {
-    const MASK: usize = (1 << BITS) - 1;
-    const MIN: isize = (1 << (BITS - 1)) - 1;
-    const MAX: isize = -(1 << (BITS - 1));
-    fn into_checked(self) -> Option<Int<i8, BITS>> {
-        if self < <Self as SignedIntoChecked<Int<i8, BITS>>>::MIN
-            || self > <Self as SignedIntoChecked<Int<i8, BITS>>>::MAX
+impl<A, const BITS: usize> CheckedCasting<Int<A, BITS>> for i64
+where
+    A: 'static + BuiltinInteger + SignedInteger,
+    Int<A, BITS>: Integer<UnderlyingType = A>,
+    Self: AsPrimitive<A>,
+{
+    fn cast_checked(self) -> Result<Int<A, BITS>, CastingError> {
+        if <Int<A, BITS> as Integer>::MIN.as_i64() <= self.as_i64()
+            && <Int<A, BITS> as Integer>::MAX.as_i64() >= self.as_i64()
         {
-            None
-        } else {
-            Some(unsafe {
-                Int::<i8, BITS>::new_unchecked(
-                    ((self as usize) & <Self as SignedIntoChecked<Int<i8, BITS>>>::MASK) as i8,
-                )
-            })
+            if let Ok(value) = <Int<A, BITS> as Integer>::try_new(AsPrimitive::as_(self)) {
+                return Ok(value);
+            }
         }
-    }
-}
 
-impl<const BITS: usize> SignedIntoChecked<Int<i16, BITS>> for isize {
-    const MASK: usize = (1 << BITS) - 1;
-    const MIN: isize = -(1 << (BITS - 1));
-    const MAX: isize = (1 << (BITS - 1)) - 1;
-    fn into_checked(self) -> Option<Int<i16, BITS>> {
-        if self < <Self as SignedIntoChecked<Int<i16, BITS>>>::MIN
-            || self > <Self as SignedIntoChecked<Int<i16, BITS>>>::MAX
-        {
-            None
-        } else {
-            Some(unsafe {
-                Int::<i16, BITS>::new_unchecked(
-                    ((self as usize) & <Self as SignedIntoChecked<Int<i16, BITS>>>::MASK) as i16,
-                )
-            })
-        }
+        Err(CastingError {
+            value: self.as_i64(),
+            range: Range {
+                start: <Int<A, BITS> as Integer>::MIN.as_i64(),
+                end: <Int<A, BITS> as Integer>::MAX.as_i64(),
+            },
+        })
     }
 }
 
@@ -772,7 +769,7 @@ impl<'t> Parser<'t> {
         None
     }
 
-    fn consume_integer(&mut self) -> Result<Spanned<usize>, Spanned<Error>> {
+    fn consume_integer(&mut self) -> Result<Spanned<UnsignedStorageInteger>, Spanned<Error>> {
         if let Some(Spanned {
             value: SemanticToken { value: token, .. },
             span,
@@ -850,17 +847,20 @@ impl<'t> Parser<'t> {
         &mut self,
     ) -> Result<Spanned<UInt<T, BITS>>, Spanned<Error>>
     where
-        T: UnsignedInteger + BuiltinInteger,
-        usize: UnsignedIntoChecked<UInt<T, BITS>>,
+        T: BuiltinInteger + UnsignedInteger,
+        UInt<T, BITS>: Integer<UnderlyingType = T>,
+        UnsignedStorageInteger: CheckedCasting<UInt<T, BITS>>,
     {
         let Spanned {
             value: magnitude,
             span,
         } = self.consume_integer()?;
-        let value = magnitude.into_checked().ok_or(Spanned::new(
-            Error::IntegerOverflow { value: None },
-            span.clone(),
-        ))?;
+        let value = magnitude.cast_checked().map_err(|e| {
+            Spanned::new(
+                Error::integer_literal_out_of_range(e.range, e.value),
+                span.clone(),
+            )
+        })?;
         Ok(Spanned::new(value, span))
     }
 
@@ -869,7 +869,8 @@ impl<'t> Parser<'t> {
     ) -> Result<Spanned<Int<T, BITS>>, Spanned<Error>>
     where
         T: SignedInteger + BuiltinInteger,
-        isize: SignedIntoChecked<Int<T, BITS>>,
+        Int<T, BITS>: Integer<UnderlyingType = T>,
+        SignedStorageInteger: CheckedCasting<Int<T, BITS>>,
     {
         let negative;
         let sign_span;
@@ -892,21 +893,17 @@ impl<'t> Parser<'t> {
             Some(s) => s.merge(&value_span),
             None => value_span,
         };
-        let widened_magnitude: isize = magnitude
-            .try_into()
-            .map_err(|_| Spanned::new(Error::IntegerOverflow { value: None }, new_span.clone()))?;
         let signed_value = if negative {
-            widened_magnitude.checked_neg().ok_or_else(|| {
-                Spanned::new(Error::IntegerOverflow { value: None }, new_span.clone())
-            })?
+            (magnitude as SignedStorageInteger).neg()
         } else {
-            widened_magnitude
+            magnitude as SignedStorageInteger
         };
-
-        let value = signed_value.into_checked().ok_or(Spanned::new(
-            Error::IntegerOverflow { value: None },
-            new_span.clone(),
-        ))?;
+        let value = signed_value.cast_checked().map_err(|e| {
+            Spanned::new(
+                Error::integer_literal_out_of_range(e.range, e.value),
+                new_span.clone(),
+            )
+        })?;
         Ok(Spanned::new(value, new_span))
     }
 
@@ -1253,44 +1250,4 @@ impl<'t> Parser<'t> {
 
 pub fn parse(tokens: &[Cow<Spanned<SemanticToken>>]) -> Result<Vec<GlobalBlock>, Spanned<Error>> {
     Parser::new(tokens).parse()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{lexer, parser, preprocessor};
-    use indoc::indoc;
-
-    macro_rules! preprocess_str {
-        ($source:expr) => {
-            let original_tokens = lexer::tokenize(source).unwrap();
-            let preprocessed_tokens = preprocessor::preprocess(&original_tokens).unwrap();
-
-            preprocessed_tokens
-        };
-    }
-
-    fn parse_str(source: &str) -> Result<Vec<GlobalBlock>, Spanned<Error>> {
-        let original_tokens = lexer::tokenize(source).unwrap();
-        let preprocessed_tokens = preprocessor::preprocess(&original_tokens).unwrap();
-
-        parse(&preprocessed_tokens)
-    }
-
-    // #[test]
-    // fn use_unknown_local_label() {
-    //     assert_eq!(
-    //         parse_str(indoc! {"
-    //             _start:
-    //                 nop
-    //
-    //             .target_0:
-    //                 jmp .target_3
-    //
-    //             .target_1:
-    //                 nop
-    //         "}),
-    //         Spanned::new(Error::UnknownInstruction {}, Span::new(0, 0))
-    //     );
-    // }
 }

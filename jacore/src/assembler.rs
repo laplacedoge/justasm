@@ -1,8 +1,8 @@
-use crate::Spanned;
 use crate::parser::{
-    self, BinaryForm, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR, GlobalBlock, LocalBlock, PseudoForm,
-    SignedIntoChecked, SymbolicForm,
+    self, BinaryForm, CheckedCasting, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR, GlobalBlock,
+    LocalBlock, PseudoForm, SymbolicForm,
 };
+use crate::{SignedStorageInteger, Spanned};
 use bilge::prelude::*;
 use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
@@ -151,8 +151,9 @@ impl DynamicForm {
         let expanded_form = match &self.symbolic_form {
             SymbolicForm::Jmp(label) => {
                 let target_addr = lookup_label(globals, locals, label)?;
-                let new_offset = target_addr as isize - offset as isize;
-                if let Some(offset) = new_offset.into_checked() {
+                let new_offset =
+                    target_addr as SignedStorageInteger - offset as SignedStorageInteger;
+                if let Ok(offset) = new_offset.cast_checked() {
                     ExpandedForm::OneInstruction([BinaryForm::jpp(offset)])
                 } else {
                     let suffix = BinaryForm::jpr(GP_REG_JUMP_ASSIST, i8::new(0));
@@ -177,7 +178,7 @@ impl DynamicForm {
             SymbolicForm::Cal(label) => {
                 let target_addr = lookup_label(globals, locals, label)?;
                 let new_offset = target_addr as isize - offset as isize;
-                if let Some(offset) = new_offset.into_checked() {
+                if let Ok(offset) = (new_offset as SignedStorageInteger).cast_checked() {
                     ExpandedForm::OneInstruction([BinaryForm::jlp(offset)])
                 } else {
                     let suffix = BinaryForm::jlr(GP_REG_JUMP_ASSIST, i8::new(0));
@@ -215,12 +216,14 @@ impl DynamicForm {
                         _ => unsafe { unreachable_unchecked() },
                     };
                 let new_offset = lookup_label(globals, locals, label)? as isize - offset as isize;
-                let binary_form = new_binary_form(new_offset.into_checked().ok_or(
-                    Error::RelativeBranchOutOfRange {
-                        label: label.to_owned(),
-                        offset: new_offset,
-                    },
-                )?);
+                let binary_form = new_binary_form(
+                    (new_offset as SignedStorageInteger)
+                        .cast_checked()
+                        .map_err(|_| Error::RelativeBranchOutOfRange {
+                            label: label.to_owned(),
+                            offset: new_offset,
+                        })?,
+                );
                 ExpandedForm::OneInstruction([binary_form])
             }
         };

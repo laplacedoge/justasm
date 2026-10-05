@@ -1,4 +1,4 @@
-use crate::{Span, Spanned};
+use crate::{Span, Spanned, UnsignedStorageInteger};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
 
@@ -61,7 +61,7 @@ enum State {
 
 #[derive(Debug, Clone)]
 pub enum Token {
-    Integer(usize),
+    Integer(UnsignedStorageInteger),
     Name(String),
     Label(String),
     Comma,
@@ -225,10 +225,10 @@ trait LexerChar {
     fn is_whitespace_char(&self) -> bool;
     fn is_identifier_first_char(&self) -> bool;
     fn is_identifier_other_char(&self) -> bool;
-    fn as_binary_integer_digit(&self) -> Option<usize>;
-    fn as_octal_integer_digit(&self) -> Option<usize>;
-    fn as_decimal_integer_digit(&self) -> Option<usize>;
-    fn as_hexadecimal_integer_digit(&self) -> Option<usize>;
+    fn as_binary_integer_digit(&self) -> Option<UnsignedStorageInteger>;
+    fn as_octal_integer_digit(&self) -> Option<UnsignedStorageInteger>;
+    fn as_decimal_integer_digit(&self) -> Option<UnsignedStorageInteger>;
+    fn as_hexadecimal_integer_digit(&self) -> Option<UnsignedStorageInteger>;
 }
 
 impl LexerChar for char {
@@ -244,32 +244,32 @@ impl LexerChar for char {
         matches!(self, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9')
     }
 
-    fn as_binary_integer_digit(&self) -> Option<usize> {
+    fn as_binary_integer_digit(&self) -> Option<UnsignedStorageInteger> {
         match self {
-            '0'..='1' => Some(*self as usize - '0' as usize),
+            '0'..='1' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
             _ => None,
         }
     }
 
-    fn as_octal_integer_digit(&self) -> Option<usize> {
+    fn as_octal_integer_digit(&self) -> Option<UnsignedStorageInteger> {
         match self {
-            '0'..='7' => Some(*self as usize - '0' as usize),
+            '0'..='7' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
             _ => None,
         }
     }
 
-    fn as_decimal_integer_digit(&self) -> Option<usize> {
+    fn as_decimal_integer_digit(&self) -> Option<UnsignedStorageInteger> {
         match self {
-            '0'..='9' => Some(*self as usize - '0' as usize),
+            '0'..='9' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
             _ => None,
         }
     }
 
-    fn as_hexadecimal_integer_digit(&self) -> Option<usize> {
+    fn as_hexadecimal_integer_digit(&self) -> Option<UnsignedStorageInteger> {
         match self {
-            '0'..='9' => Some(*self as usize - '0' as usize),
-            'A'..='F' => Some(*self as usize - 'A' as usize + 10),
-            'a'..='f' => Some(*self as usize - 'a' as usize + 10),
+            '0'..='9' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
+            'A'..='F' => Some(*self as UnsignedStorageInteger - 'A' as UnsignedStorageInteger + 10),
+            'a'..='f' => Some(*self as UnsignedStorageInteger - 'a' as UnsignedStorageInteger + 10),
             _ => None,
         }
     }
@@ -285,7 +285,7 @@ struct Lexer<'s> {
     source: &'s str,
     state: State,
     string_buf: String,
-    integer_buf: usize,
+    integer_buf: UnsignedStorageInteger,
     num_digits: usize,
     offset: usize,
     start: usize,
@@ -324,7 +324,7 @@ impl<'s> Lexer<'s> {
         Token::Directive(self.pop_string_buf())
     }
 
-    fn pop_integer_buf(&mut self) -> usize {
+    fn pop_integer_buf(&mut self) -> UnsignedStorageInteger {
         std::mem::take(&mut self.integer_buf)
     }
 
@@ -374,7 +374,8 @@ impl<'s> Lexer<'s> {
                         Ok(Action::Continue)
                     }
                     '1'..='9' => {
-                        self.integer_buf = c as usize - '0' as usize;
+                        self.integer_buf =
+                            c as UnsignedStorageInteger - '0' as UnsignedStorageInteger;
                         self.num_digits = 1;
                         self.state = State::DecimalInteger;
                         Ok(Action::Continue)
@@ -515,7 +516,7 @@ impl<'s> Lexer<'s> {
             }
             State::SingleQuote => {
                 if matches!(c, ' '..='~') {
-                    self.integer_buf = c as usize;
+                    self.integer_buf = c as UnsignedStorageInteger;
                     self.state = State::Char;
 
                     return Ok(Action::Continue);

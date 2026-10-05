@@ -6,6 +6,9 @@ pub mod parser;
 pub mod preprocessor;
 pub mod scanner;
 
+pub type UnsignedStorageInteger = u64;
+pub type SignedStorageInteger = i64;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Span {
     pub offset: usize,
