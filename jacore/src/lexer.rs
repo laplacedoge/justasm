@@ -1,6 +1,5 @@
 use crate::{Span, Spanned, UnsignedStorageInteger};
 use std::cell::Cell;
-use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
 pub enum Error {
@@ -11,10 +10,19 @@ pub enum Error {
     LeadingZero,
     ValidDigitNotFound,
     UnexpectedEos,
+    InvalidBinaryDigit {
+        c: char,
+    },
+    InvalidOctalDigit {
+        c: char,
+    },
+    InvalidHexadecimalDigit {
+        c: char,
+    },
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::UnexpectedChar {
                 unexpected,
@@ -36,6 +44,23 @@ impl Display for Error {
             }
             Error::UnexpectedEos => {
                 write!(f, "Unexpected EOS")
+            }
+            Error::InvalidBinaryDigit { c } => {
+                write!(
+                    f,
+                    "Invalid binary digit '{}', must match pattern /[0-1]/",
+                    c
+                )
+            }
+            Error::InvalidOctalDigit { c } => {
+                write!(f, "Invalid octal digit '{}', must match pattern /[0-7]/", c)
+            }
+            Error::InvalidHexadecimalDigit { c } => {
+                write!(
+                    f,
+                    "Invalid hexadecimal digit '{}', must match pattern /[0-9A-Fa-f]/",
+                    c
+                )
             }
         }
     }
@@ -130,8 +155,8 @@ impl Token {
     }
 }
 
-impl Display for Token {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Token::Integer(i) => write!(f, "{}", i),
             Token::Name(s) => write!(f, "Name:\"{}\"", s),
@@ -162,8 +187,8 @@ pub enum Semantic {
     Alias,
 }
 
-impl Display for Semantic {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for Semantic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Semantic::Label => write!(f, "Label"),
             Semantic::Instruction => write!(f, "Instruction"),
@@ -202,8 +227,8 @@ impl SemanticToken {
     }
 }
 
-impl Display for SemanticToken {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for SemanticToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.semantic.get() {
             Some(s) => write!(f, "{}&{}", self.value, s),
             None => write!(f, "{}&?", self.value),
@@ -211,8 +236,8 @@ impl Display for SemanticToken {
     }
 }
 
-impl Display for Spanned<SemanticToken> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for Spanned<SemanticToken> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "@{}+{}:{}",
@@ -225,10 +250,10 @@ trait LexerChar {
     fn is_whitespace_char(&self) -> bool;
     fn is_identifier_first_char(&self) -> bool;
     fn is_identifier_other_char(&self) -> bool;
-    fn as_binary_integer_digit(&self) -> Option<UnsignedStorageInteger>;
-    fn as_octal_integer_digit(&self) -> Option<UnsignedStorageInteger>;
-    fn as_decimal_integer_digit(&self) -> Option<UnsignedStorageInteger>;
-    fn as_hexadecimal_integer_digit(&self) -> Option<UnsignedStorageInteger>;
+    fn into_binary_digit(self) -> Result<Option<usize>, Error>;
+    fn into_octal_digit(self) -> Result<Option<usize>, Error>;
+    fn into_decimal_digit(self) -> Option<usize>;
+    fn into_hexadecimal_digit(self) -> Result<Option<usize>, Error>;
 }
 
 impl LexerChar for char {
@@ -244,33 +269,36 @@ impl LexerChar for char {
         matches!(self, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9')
     }
 
-    fn as_binary_integer_digit(&self) -> Option<UnsignedStorageInteger> {
+    fn into_binary_digit(self) -> Result<Option<usize>, Error> {
         match self {
-            '0'..='1' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
+            '0'..='1' => Ok(Some(self as usize - '0' as usize)),
+            '2'..='9' | 'A'..='Z' | 'a'..='z' => Err(Error::InvalidBinaryDigit { c: self }),
+            _ => Ok(None),
+        }
+    }
+
+    fn into_octal_digit(self) -> Result<Option<usize>, Error> {
+        match self {
+            '0'..='7' => Ok(Some(self as usize - '0' as usize)),
+            '8'..='9' | 'A'..='Z' | 'a'..='z' => Err(Error::InvalidOctalDigit { c: self }),
+            _ => Ok(None),
+        }
+    }
+
+    fn into_decimal_digit(self) -> Option<usize> {
+        match self {
+            '0'..='9' => Some(self as usize - '0' as usize),
             _ => None,
         }
     }
 
-    fn as_octal_integer_digit(&self) -> Option<UnsignedStorageInteger> {
+    fn into_hexadecimal_digit(self) -> Result<Option<usize>, Error> {
         match self {
-            '0'..='7' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
-            _ => None,
-        }
-    }
-
-    fn as_decimal_integer_digit(&self) -> Option<UnsignedStorageInteger> {
-        match self {
-            '0'..='9' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
-            _ => None,
-        }
-    }
-
-    fn as_hexadecimal_integer_digit(&self) -> Option<UnsignedStorageInteger> {
-        match self {
-            '0'..='9' => Some(*self as UnsignedStorageInteger - '0' as UnsignedStorageInteger),
-            'A'..='F' => Some(*self as UnsignedStorageInteger - 'A' as UnsignedStorageInteger + 10),
-            'a'..='f' => Some(*self as UnsignedStorageInteger - 'a' as UnsignedStorageInteger + 10),
-            _ => None,
+            '0'..='9' => Ok(Some(self as usize - '0' as usize)),
+            'A'..='F' => Ok(Some(self as usize - 'A' as usize + 10)),
+            'a'..='f' => Ok(Some(self as usize - 'a' as usize + 10)),
+            'G'..='Z' | 'g'..='z' => Err(Error::InvalidHexadecimalDigit { c: self }),
+            _ => Ok(None),
         }
     }
 }
@@ -471,9 +499,12 @@ impl<'s> Lexer<'s> {
                 Ok(Action::Continue)
             }
             State::BinaryInteger => {
-                if let Some(value) = c.as_binary_integer_digit() {
+                if let Some(value) = c
+                    .into_binary_digit()
+                    .map_err(|e| Spanned::new(e, Span::new(self.offset, 1)))?
+                {
                     self.integer_buf <<= 1;
-                    self.integer_buf += value;
+                    self.integer_buf += value as UnsignedStorageInteger;
                     self.num_digits += 1;
 
                     return Ok(Action::Continue);
@@ -482,9 +513,12 @@ impl<'s> Lexer<'s> {
                 self.finalize_prefixed_integer_literal()
             }
             State::OctalInteger => {
-                if let Some(value) = c.as_octal_integer_digit() {
+                if let Some(value) = c
+                    .into_octal_digit()
+                    .map_err(|e| Spanned::new(e, Span::new(self.offset, 1)))?
+                {
                     self.integer_buf <<= 3;
-                    self.integer_buf += value;
+                    self.integer_buf += value as UnsignedStorageInteger;
                     self.num_digits += 1;
 
                     return Ok(Action::Continue);
@@ -493,9 +527,9 @@ impl<'s> Lexer<'s> {
                 self.finalize_prefixed_integer_literal()
             }
             State::DecimalInteger => {
-                if let Some(value) = c.as_decimal_integer_digit() {
+                if let Some(value) = c.into_decimal_digit() {
                     self.integer_buf *= 10;
-                    self.integer_buf += value;
+                    self.integer_buf += value as UnsignedStorageInteger;
                     self.num_digits += 1;
 
                     return Ok(Action::Continue);
@@ -504,9 +538,12 @@ impl<'s> Lexer<'s> {
                 self.finalize_prefixed_integer_literal()
             }
             State::HexadecimalInteger => {
-                if let Some(value) = c.as_hexadecimal_integer_digit() {
+                if let Some(value) = c
+                    .into_hexadecimal_digit()
+                    .map_err(|e| Spanned::new(e, Span::new(self.offset, 1)))?
+                {
                     self.integer_buf <<= 4;
-                    self.integer_buf += value;
+                    self.integer_buf += value as UnsignedStorageInteger;
                     self.num_digits += 1;
 
                     return Ok(Action::Continue);
