@@ -27,6 +27,9 @@ pub enum Error {
         range: Range<i64>,
         value: i64,
     },
+    ExpectedStatementEnd {
+        unexpected: &'static Token,
+    },
 }
 
 impl Error {
@@ -67,6 +70,9 @@ impl std::fmt::Display for Error {
                     "Integer literal '{}' is out of the range of [{}, {}]",
                     value, range.start, range.end
                 )
+            }
+            Error::ExpectedStatementEnd { unexpected } => {
+                write!(f, "Expected statement end, found '{}'", unexpected.tag())
             }
         }
     }
@@ -792,6 +798,45 @@ impl<'t> Parser<'t> {
         ))
     }
 
+    fn consume_statement_end(&mut self) -> Result<(), Spanned<Error>> {
+        if let Some(Spanned {
+            value: SemanticToken { value: token, .. },
+            span,
+        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
+        {
+            if let Token::Boundary = token {
+                self.offset += 1;
+                Ok(())
+            } else {
+                Err(Spanned::new(
+                    Error::ExpectedStatementEnd {
+                        unexpected: &token.to_dummy(),
+                    },
+                    span.to_owned(),
+                ))
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn skip_boundaries(&mut self) {
+        loop {
+            if let Some(Spanned {
+                value: SemanticToken { value: token, .. },
+                ..
+            }) = self.tokens.get(self.offset).map(|c| c.as_ref())
+            {
+                if let Token::Boundary = token {
+                    self.offset += 1;
+                    continue;
+                }
+            }
+
+            break;
+        }
+    }
+
     fn consume_gp_register(&mut self) -> Result<Spanned<u3>, Spanned<Error>> {
         if let Some(Spanned {
             value:
@@ -997,6 +1042,8 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_instruction(&mut self) -> Result<Option<Spanned<Instruction>>, Spanned<Error>> {
+        self.skip_boundaries();
+
         if let Some((
             Spanned {
                 span: mnemonic_span,
@@ -1190,6 +1237,8 @@ impl<'t> Parser<'t> {
                 }
             };
 
+            self.consume_statement_end()?;
+
             return Ok(Some(Spanned::new(
                 instruction,
                 mnemonic_span.merge(&operand_span),
@@ -1200,6 +1249,8 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_local_block(&mut self) -> Result<Option<LocalBlock>, Spanned<Error>> {
+        self.skip_boundaries();
+
         if let Some(label) = self.expect_local_label() {
             let mut instructions = vec![];
             loop {
@@ -1220,6 +1271,8 @@ impl<'t> Parser<'t> {
     }
 
     fn parse_global_block(&mut self) -> Result<Option<GlobalBlock>, Spanned<Error>> {
+        self.skip_boundaries();
+
         if let Some(label) = self.expect_global_label() {
             let mut instructions = vec![];
             loop {

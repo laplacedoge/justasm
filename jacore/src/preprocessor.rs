@@ -15,6 +15,9 @@ pub enum Error {
     UnknownDirective {
         name: String,
     },
+    ExpectedStatementEnd {
+        unexpected: &'static Token,
+    },
     UnexpectedEos,
 }
 
@@ -26,6 +29,9 @@ impl std::fmt::Display for Error {
                 expected,
             } => format_unexpected_token_error(f, unexpected, expected),
             Error::UnknownDirective { name } => write!(f, "Unknown directive '{}'", name),
+            Error::ExpectedStatementEnd { unexpected } => {
+                write!(f, "Expected statement end, found '{}'", unexpected.tag())
+            }
             Error::UnexpectedEos => write!(f, "Unexpected EOS"),
         }
     }
@@ -112,6 +118,28 @@ impl<'s> Preprocessor<'s> {
         }
     }
 
+    fn consume_statement_end(&mut self) -> Result<(), Spanned<Error>> {
+        if let Some(Spanned {
+            value: SemanticToken { value: token, .. },
+            span,
+        }) = self.tokens.get(self.offset)
+        {
+            if let Token::Boundary = token {
+                self.offset += 1;
+                Ok(())
+            } else {
+                Err(Spanned::new(
+                    Error::ExpectedStatementEnd {
+                        unexpected: &token.to_dummy(),
+                    },
+                    span.to_owned(),
+                ))
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     fn parse_directive_alias(&mut self) -> Result<(), Spanned<Error>> {
         let alias = self
             .consume_any(&[(&dummy::NAME, Semantic::Alias)])?
@@ -134,6 +162,8 @@ impl<'s> Preprocessor<'s> {
                     _ => std::hint::unreachable_unchecked(),
                 }
             });
+
+        self.consume_statement_end()?;
 
         self.table.insert(alias.into_inner(), value.into_inner());
 

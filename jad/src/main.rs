@@ -17,13 +17,13 @@ pub const LEGEND_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::COMMENT,   // 7
 ];
 
-trait SemanticTypedToken {
+trait SemanticLegend {
     fn to_legend(&self) -> u32;
 }
 
-impl SemanticTypedToken for lexer::SemanticToken {
+impl SemanticLegend for Option<lexer::Semantic> {
     fn to_legend(&self) -> u32 {
-        match self.semantic.get() {
+        match self {
             None => 0,
             Some(s) => match s {
                 lexer::Semantic::Label => 1,
@@ -210,25 +210,37 @@ fn analyze_source(source: String) -> (AnalyzedSource, Vec<Diagnostic>) {
     let mut last_line = 0;
     let mut last_start_char = 0;
 
-    for token in &tokens {
-        let location = info.locate(token.span.offset).unwrap();
-        let delta_line = location.row - last_line;
-        let delta_start_char = if delta_line == 0 {
-            location.column - last_start_char
-        } else {
-            location.column
-        };
+    for Spanned {
+        value: lexer::SemanticToken {
+            value: token,
+            semantic,
+        },
+        span,
+    } in &tokens
+    {
+        match token {
+            lexer::Token::Boundary => {}
+            _ => {
+                let location = info.locate(span.offset).unwrap();
+                let delta_line = location.row - last_line;
+                let delta_start_char = if delta_line == 0 {
+                    location.column - last_start_char
+                } else {
+                    location.column
+                };
 
-        analyzed.semantic_tokens.push(SemanticToken {
-            delta_line: delta_line as u32,
-            delta_start: delta_start_char as u32,
-            length: token.span.length as u32,
-            token_type: token.inner().to_legend(),
-            token_modifiers_bitset: 0,
-        });
+                analyzed.semantic_tokens.push(SemanticToken {
+                    delta_line: delta_line as u32,
+                    delta_start: delta_start_char as u32,
+                    length: span.length as u32,
+                    token_type: semantic.get().to_legend(),
+                    token_modifiers_bitset: 0,
+                });
 
-        last_line = location.row;
-        last_start_char = location.column;
+                last_line = location.row;
+                last_start_char = location.column;
+            }
+        }
     }
 
     (analyzed, diagnostics)

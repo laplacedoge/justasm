@@ -30,9 +30,9 @@ impl std::fmt::Display for Error {
             } => match expected {
                 Some(expected) => write!(
                     f,
-                    "Unexpected character '{}', expected '{}'",
+                    "Expected character '{}', found '{}'",
+                    expected.escape_debug(),
                     unexpected.escape_debug(),
-                    expected.escape_debug()
                 ),
                 None => write!(f, "Unexpected character '{}'", unexpected.escape_debug()),
             },
@@ -69,6 +69,8 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 enum State {
+    Whitespace,
+    Boundary,
     Start,
     Name,
     Zero,
@@ -86,6 +88,7 @@ enum State {
 
 #[derive(Debug, Clone)]
 pub enum Token {
+    Boundary,
     Integer(UnsignedStorageInteger),
     Name(String),
     Label(String),
@@ -115,6 +118,7 @@ pub mod dummy {
     pub static RIGHT_BRACKET: Token = Token::RightBracket;
     pub static COMMENT: Token = Token::Comment(String::new());
     pub static DIRECTIVE: Token = Token::Directive(String::new());
+    pub static BOUNDARY: Token = Token::Boundary;
 }
 
 impl Token {
@@ -132,6 +136,7 @@ impl Token {
             Token::RightBracket => &dummy::RIGHT_BRACKET,
             Token::Comment(_) => &dummy::COMMENT,
             Token::Directive(_) => &dummy::DIRECTIVE,
+            Token::Boundary => &dummy::BOUNDARY,
         }
     }
 }
@@ -151,6 +156,7 @@ impl Token {
             Token::RightBracket => "']'",
             Token::Comment(_) => "COMMENT",
             Token::Directive(_) => "DIRECTIVE",
+            Token::Boundary => "BOUNDARY",
         }
     }
 }
@@ -170,6 +176,7 @@ impl std::fmt::Display for Token {
             Token::RightBracket => write!(f, "']'"),
             Token::Comment(s) => write!(f, "Comment:\"{}\"", s),
             Token::Directive(s) => write!(f, "Directive:\"{}\"", s),
+            Token::Boundary => write!(f, "Boundary"),
         }
     }
 }
@@ -258,7 +265,7 @@ trait LexerChar {
 
 impl LexerChar for char {
     fn is_whitespace_char(&self) -> bool {
-        matches!(self, ' ' | '\t' | '\r' | '\n')
+        matches!(self, ' ' | '\r' | '\n')
     }
 
     fn is_identifier_first_char(&self) -> bool {
@@ -305,6 +312,7 @@ impl LexerChar for char {
 
 enum Action {
     Continue,
+    Again,
     YieldAndContinue((Token, Option<Semantic>)),
     YieldAndAgain((Token, Option<Semantic>)),
 }
@@ -381,7 +389,13 @@ impl<'s> Lexer<'s> {
                 // Mark the starting offset of the next lexeme
                 self.start = self.offset;
 
-                if c.is_whitespace_char() {
+                if matches!(c, ' ') {
+                    self.state = State::Whitespace;
+                    return Ok(Action::Continue);
+                }
+
+                if matches!(c, '\r' | '\n') {
+                    self.state = State::Boundary;
                     return Ok(Action::Continue);
                 }
 
@@ -459,6 +473,27 @@ impl<'s> Lexer<'s> {
                         Span::new(self.offset, 1),
                     )),
                 }
+            }
+            State::Whitespace => {
+                if matches!(c, ' ') {
+                    return Ok(Action::Continue);
+                }
+
+                if matches!(c, '\r' | '\n') {
+                    self.state = State::Boundary;
+                    return Ok(Action::Continue);
+                }
+
+                self.state = State::Start;
+                Ok(Action::Again)
+            }
+            State::Boundary => {
+                if c.is_whitespace_char() {
+                    return Ok(Action::Continue);
+                }
+
+                self.state = State::Start;
+                Ok(Action::YieldAndAgain((Token::Boundary, None)))
             }
             State::Name => {
                 if c.is_identifier_other_char() {
@@ -643,7 +678,7 @@ impl<'s> Lexer<'s> {
 
     fn feed_eos(&mut self) -> Result<Option<(Token, Option<Semantic>)>, Spanned<Error>> {
         match self.state {
-            State::Start => Ok(None),
+            State::Start | State::Whitespace | State::Boundary => Ok(None),
             State::Name => Ok(Some((self.pop_name(), None))),
             State::Zero => Ok(Some((Token::Integer(0), Some(Semantic::Number)))),
             State::DecimalInteger => Ok(Some((self.pop_integer(), Some(Semantic::Number)))),
@@ -686,6 +721,9 @@ impl<'s> Lexer<'s> {
                     Action::Continue => {
                         self.offset += 1;
                         break;
+                    }
+                    Action::Again => {
+                        continue;
                     }
                     Action::YieldAndContinue((token, semantic)) => {
                         self.offset += 1;
