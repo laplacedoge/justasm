@@ -1127,6 +1127,21 @@ impl<'t> Parser<'t> {
                         mnemonic_span.clone(),
                     )
                 }
+                "mov" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    let rd = self.consume_gp_register()?;
+
+                    self.consume_this(&dummy::COMMA, None)?;
+
+                    let rs = self.consume_gp_register()?;
+
+                    let new_span = rd.merge_span(&rs);
+                    (
+                        Instruction::BinaryForm(BinaryForm::add(rd.value, rs.value, GP_REG_0)),
+                        new_span,
+                    )
+                }
                 "lwi" => {
                     semantic.set(Some(Semantic::PseudoInstruction));
 
