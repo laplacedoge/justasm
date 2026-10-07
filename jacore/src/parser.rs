@@ -1338,6 +1338,21 @@ impl<'t> Parser<'t> {
                         new_span,
                     )
                 }
+                "cmp" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    let ra = self.consume_gp_register()?;
+
+                    self.consume_this(&dummy::COMMA, None)?;
+
+                    let rb = self.consume_gp_register()?;
+
+                    let span = ra.merge_span(&rb);
+                    (
+                        Statement::BinaryInstruction(BinaryForm::sub(GP_REG_0, ra.value, rb.value)),
+                        span,
+                    )
+                }
                 "lwi" => {
                     semantic.set(Some(Semantic::PseudoInstruction));
 
