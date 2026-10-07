@@ -3,7 +3,7 @@ use crate::{
     SignedStorageInteger, Span, Spanned, UnsignedStorageInteger, format_unexpected_token_error,
 };
 use bilge::prelude::*;
-use num_traits::AsPrimitive;
+use num_traits::{AsPrimitive, Unsigned};
 use std::borrow::Cow;
 use std::ops::{Neg, RangeInclusive};
 
@@ -569,37 +569,84 @@ pub struct DataRepr {
 }
 
 impl DataRepr {
-    fn from_bytes<T>(values: T) -> Self
+    fn try_from_bytes<T, F>(values: T) -> Result<Self, Spanned<Error>>
     where
-        T: IntoIterator<Item = UnsignedStorageInteger>,
+        T: IntoIterator<Item = Spanned<F>>,
+        F: Unsigned + TryInto<u8> + AsPrimitive<i64>,
     {
-        Self {
-            buffer: values.into_iter().map(|v| v as u8).collect(),
-        }
-    }
-
-    fn from_words<T>(values: T) -> Self
-    where
-        T: IntoIterator<Item = UnsignedStorageInteger>,
-    {
-        Self {
+        Ok(Self {
             buffer: values
                 .into_iter()
-                .flat_map(|v| (v as u16).to_le_bytes())
-                .collect(),
-        }
+                .map(|Spanned { value: v, span }| {
+                    let s = AsPrimitive::as_(v);
+                    v.try_into().map_err(|_| {
+                        Spanned::new(
+                            Error::integer_literal_out_of_range(
+                                RangeInclusive::from(0..=(u8::MAX as i64)),
+                                s,
+                            ),
+                            span,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<u8>, Spanned<Error>>>()?,
+        })
     }
 
-    fn from_dwords<T>(values: T) -> Self
+    fn try_from_words<T, F>(values: T) -> Result<Self, Spanned<Error>>
     where
-        T: IntoIterator<Item = UnsignedStorageInteger>,
+        T: IntoIterator<Item = Spanned<F>>,
+        F: Unsigned + TryInto<u16> + AsPrimitive<i64>,
     {
-        Self {
-            buffer: values
-                .into_iter()
-                .flat_map(|v| (v as u32).to_le_bytes())
-                .collect(),
-        }
+        Ok(Self {
+            buffer: {
+                let words = values
+                    .into_iter()
+                    .map(|Spanned { value: v, span }| {
+                        let s = AsPrimitive::as_(v);
+                        v.try_into().map(|v| v.to_le_bytes()).map_err(|_| {
+                            Spanned::new(
+                                Error::integer_literal_out_of_range(
+                                    RangeInclusive::from(0..=(u16::MAX as i64)),
+                                    s,
+                                ),
+                                span,
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                words.into_iter().flatten().collect()
+            },
+        })
+    }
+
+    fn try_from_dwords<T, F>(values: T) -> Result<Self, Spanned<Error>>
+    where
+        T: IntoIterator<Item = Spanned<F>>,
+        F: Unsigned + TryInto<u32> + AsPrimitive<i64>,
+    {
+        Ok(Self {
+            buffer: {
+                let words = values
+                    .into_iter()
+                    .map(|Spanned { value: v, span }| {
+                        let s = AsPrimitive::as_(v);
+                        v.try_into().map(|v| v.to_le_bytes()).map_err(|_| {
+                            Spanned::new(
+                                Error::integer_literal_out_of_range(
+                                    RangeInclusive::from(0..=(u32::MAX as i64)),
+                                    s,
+                                ),
+                                span,
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                words.into_iter().flatten().collect()
+            },
+        })
     }
 
     pub fn word_count(&self) -> usize {
@@ -1091,29 +1138,26 @@ impl<'t> Parser<'t> {
 
     fn parse_data_definition_list(
         &mut self,
-    ) -> Result<Spanned<Vec<UnsignedStorageInteger>>, Spanned<Error>> {
+    ) -> Result<(Vec<Spanned<UnsignedStorageInteger>>, Span), Spanned<Error>> {
         let mut list = vec![];
+        let mut span;
 
-        let Spanned { value, mut span } = self.consume_integer()?;
+        let value = self.consume_integer()?;
+        span = value.span.clone();
         list.push(value);
 
         loop {
             if self.expect_this(&dummy::COMMA, None).is_some() {
-                let Spanned {
-                    value: new_value,
-                    span: new_span,
-                } = self.consume_integer()?;
-
-                list.push(new_value);
-                span = span.merge(&new_span);
-
+                let value = self.consume_integer()?;
+                span = span.merge(&value.span);
+                list.push(value);
                 continue;
             } else {
                 break;
             }
         }
 
-        Ok(Spanned::new(list, span))
+        Ok((list, span))
     }
 
     fn parse_statement(&mut self) -> Result<Option<Spanned<Statement>>, Spanned<Error>> {
@@ -1341,23 +1385,26 @@ impl<'t> Parser<'t> {
                 }
 
                 ".byte" => {
-                    let Spanned { value: list, span } = self.parse_data_definition_list()?;
-
-                    (Statement::DataDefinition(DataRepr::from_bytes(list)), span)
-                }
-                ".word" => {
-                    let Spanned { value: list, span } = self.parse_data_definition_list()?;
+                    let (list, span) = self.parse_data_definition_list()?;
 
                     (
-                        Statement::DataDefinition(DataRepr::from_words(list.into_iter())),
+                        Statement::DataDefinition(DataRepr::try_from_bytes(list)?),
+                        span,
+                    )
+                }
+                ".word" => {
+                    let (list, span) = self.parse_data_definition_list()?;
+
+                    (
+                        Statement::DataDefinition(DataRepr::try_from_words(list)?),
                         span,
                     )
                 }
                 ".dword" => {
-                    let Spanned { value: list, span } = self.parse_data_definition_list()?;
+                    let (list, span) = self.parse_data_definition_list()?;
 
                     (
-                        Statement::DataDefinition(DataRepr::from_dwords(list.into_iter())),
+                        Statement::DataDefinition(DataRepr::try_from_dwords(list)?),
                         span,
                     )
                 }
