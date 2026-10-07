@@ -5,7 +5,7 @@ use crate::{
 use bilge::prelude::*;
 use num_traits::AsPrimitive;
 use std::borrow::Cow;
-use std::ops::{Neg, Range};
+use std::ops::{Neg, RangeInclusive};
 
 #[derive(Debug)]
 pub enum Error {
@@ -24,7 +24,7 @@ pub enum Error {
         name: String,
     },
     IntegerLiteralOutOfRange {
-        range: Range<i64>,
+        range: RangeInclusive<i64>,
         value: i64,
     },
     ExpectedStatementEnd {
@@ -40,7 +40,7 @@ impl Error {
         }
     }
 
-    fn integer_literal_out_of_range(range: Range<i64>, value: i64) -> Self {
+    fn integer_literal_out_of_range(range: RangeInclusive<i64>, value: i64) -> Self {
         Error::IntegerLiteralOutOfRange { range, value }
     }
 }
@@ -67,8 +67,8 @@ impl std::fmt::Display for Error {
             Error::IntegerLiteralOutOfRange { range, value } => {
                 write!(
                     f,
-                    "Integer literal '{}' is out of the range of [{}, {}]",
-                    value, range.start, range.end
+                    "Integer literal '{}' is out of the range of {:?}",
+                    value, range
                 )
             }
             Error::ExpectedStatementEnd { unexpected } => {
@@ -145,7 +145,7 @@ pub const GP_REG_LR: u3 = u3::new(7);
 pub const GP_REG_JUMP_ASSIST: u3 = u3::new(5);
 
 pub struct CastingError {
-    range: Range<i64>,
+    range: RangeInclusive<i64>,
     value: i64,
 }
 
@@ -168,10 +168,7 @@ where
 
         Err(CastingError {
             value: self.as_i64(),
-            range: Range {
-                start: 0,
-                end: <UInt<A, BITS> as Integer>::MAX.as_i64(),
-            },
+            range: RangeInclusive::from(0..=<UInt<A, BITS> as Integer>::MAX.as_i64()),
         })
     }
 }
@@ -193,10 +190,9 @@ where
 
         Err(CastingError {
             value: self.as_i64(),
-            range: Range {
-                start: <Int<A, BITS> as Integer>::MIN.as_i64(),
-                end: <Int<A, BITS> as Integer>::MAX.as_i64(),
-            },
+            range: RangeInclusive::from(
+                <Int<A, BITS> as Integer>::MIN.as_i64()..=<Int<A, BITS> as Integer>::MAX.as_i64(),
+            ),
         })
     }
 }
