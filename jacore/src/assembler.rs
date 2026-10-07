@@ -8,7 +8,7 @@ use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
 
-const MEM_ADDR_ROM_START: u16 = 0x2000;
+const MEM_ADDR_ROM_START: usize = 0x2000;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -74,68 +74,54 @@ fn lookup_label(
     .map(|offset| offset.to_owned())
 }
 
-enum ImmediateLoadForm {
-    Direct([BinaryForm; 1]),
-    TwoStage([BinaryForm; 2]),
-}
-
-impl ImmediateLoadForm {
-    fn new(rd: u3, imm: u16) -> Self {
-        if imm == 0 {
-            ImmediateLoadForm::Direct([BinaryForm::add(rd, GP_REG_0, GP_REG_0)])
-        } else if imm & 0b0000_0001_1111_1111 != 0 && imm & 0b1111_1110_0000_0000 == 0 {
-            ImmediateLoadForm::Direct([BinaryForm::lli(rd, u9::new(imm))])
-        } else if imm & 0b1111_1111_1000_0000 != 0 && imm & 0b0000_0000_0111_1111 == 0 {
-            ImmediateLoadForm::Direct([BinaryForm::lui(rd, u9::new(imm >> 7))])
-        } else {
-            ImmediateLoadForm::TwoStage([
+fn expand_word_immediate_load(
+    rd: u3,
+    imm: u16,
+    prev_expanded_len: Option<usize>,
+) -> SmallVec<[BinaryForm; 3]> {
+    if let Some(len) = prev_expanded_len {
+        if len >= 2 {
+            return smallvec![
                 BinaryForm::lui(rd, u9::new(imm >> 7)),
                 BinaryForm::adi(rd, u9::new(imm & 0b0000_0000_0111_1111)),
-            ])
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ExpandedForm {
-    OneInstruction([BinaryForm; 1]),
-    TwoInstructions([BinaryForm; 2]),
-    ThreeInstructions([BinaryForm; 3]),
-}
-
-impl ExpandedForm {
-    fn as_slice(&self) -> &[BinaryForm] {
-        match self {
-            ExpandedForm::OneInstruction(i) => i.as_slice(),
-            ExpandedForm::TwoInstructions(i) => i.as_slice(),
-            ExpandedForm::ThreeInstructions(i) => i.as_slice(),
+            ];
         }
     }
 
-    fn instruction_count(&self) -> usize {
-        self.as_slice().len()
+    if imm == 0 {
+        smallvec![BinaryForm::add(rd, GP_REG_0, GP_REG_0)]
+    } else if imm & 0b0000_0001_1111_1111 != 0 && imm & 0b1111_1110_0000_0000 == 0 {
+        smallvec![BinaryForm::lli(rd, u9::new(imm))]
+    } else if imm & 0b1111_1111_1000_0000 != 0 && imm & 0b0000_0000_0111_1111 == 0 {
+        smallvec![BinaryForm::lui(rd, u9::new(imm >> 7))]
+    } else {
+        smallvec![
+            BinaryForm::lui(rd, u9::new(imm >> 7)),
+            BinaryForm::adi(rd, u9::new(imm & 0b0000_0000_0111_1111)),
+        ]
     }
 }
 
 #[derive(Debug)]
 struct DynamicForm {
     symbolic_form: SymbolicForm,
-    expanded_form: ExpandedForm,
+    expanded_forms: SmallVec<[BinaryForm; 3]>,
     expanded_count: u8,
 }
 
 impl DynamicForm {
     fn from_symbolic_form(symbolic_form: &SymbolicForm) -> Self {
-        let dummy_expanded = ExpandedForm::OneInstruction([BinaryForm::jpp(i11::new(0))]);
+        let expanded_forms = smallvec![BinaryForm::jpp(i11::new(0))];
+        let expanded_count = expanded_forms.len() as u8;
         DynamicForm {
             symbolic_form: symbolic_form.to_owned(),
-            expanded_form: dummy_expanded,
-            expanded_count: dummy_expanded.instruction_count() as u8,
+            expanded_forms,
+            expanded_count,
         }
     }
 
     fn instruction_count(&self) -> usize {
-        self.expanded_form.instruction_count()
+        self.expanded_forms.len()
     }
 
     fn expand_again(
@@ -146,61 +132,64 @@ impl DynamicForm {
     ) -> Result<bool, Error> {
         let expanded_form = match &self.symbolic_form {
             SymbolicForm::Lea { rd, label } => {
-                let address = lookup_label(globals, locals, label)? * 2;
-                match ImmediateLoadForm::new(rd.to_owned(), MEM_ADDR_ROM_START + address as u16) {
-                    ImmediateLoadForm::Direct(a) => ExpandedForm::OneInstruction([a[0]]),
-                    ImmediateLoadForm::TwoStage(a) => ExpandedForm::TwoInstructions([a[0], a[1]]),
-                }
+                let word_offset = lookup_label(globals, locals, label)?;
+                let address = MEM_ADDR_ROM_START + (word_offset * 2);
+
+                expand_word_immediate_load(
+                    rd.to_owned(),
+                    address
+                        .try_into()
+                        .map_err(|_| Error::AbsoluteBranchOutOfRange {
+                            label: label.to_owned(),
+                            address: word_offset,
+                        })?,
+                    Some(self.expanded_count as usize),
+                )
             }
             SymbolicForm::Jmp(label) => {
-                let target_addr = lookup_label(globals, locals, label)?;
-                let new_offset =
-                    target_addr as SignedStorageInteger - offset as SignedStorageInteger;
-                if let Ok(offset) = new_offset.cast_checked() {
-                    ExpandedForm::OneInstruction([BinaryForm::jpp(offset)])
+                let word_offset = lookup_label(globals, locals, label)?;
+                let new_offset = word_offset as isize - offset as isize;
+                if let Ok(offset) = (new_offset as SignedStorageInteger).cast_checked() {
+                    smallvec![BinaryForm::jpp(offset)]
                 } else {
-                    let suffix = BinaryForm::jpr(GP_REG_JUMP_ASSIST, i8::new(0));
-                    match ImmediateLoadForm::new(
+                    let address = MEM_ADDR_ROM_START + (word_offset * 2);
+                    let mut forms = expand_word_immediate_load(
                         GP_REG_JUMP_ASSIST,
-                        target_addr
+                        address
                             .try_into()
                             .map_err(|_| Error::AbsoluteBranchOutOfRange {
                                 label: label.to_owned(),
-                                address: target_addr,
+                                address: word_offset,
                             })?,
-                    ) {
-                        ImmediateLoadForm::Direct(a) => {
-                            ExpandedForm::TwoInstructions([a[0], suffix])
-                        }
-                        ImmediateLoadForm::TwoStage(a) => {
-                            ExpandedForm::ThreeInstructions([a[0], a[1], suffix])
-                        }
-                    }
+                        Some(self.expanded_count as usize - 1),
+                    );
+
+                    forms.push(BinaryForm::jpr(GP_REG_JUMP_ASSIST, 0));
+
+                    forms
                 }
             }
             SymbolicForm::Cal(label) => {
-                let target_addr = lookup_label(globals, locals, label)?;
-                let new_offset = target_addr as isize - offset as isize;
+                let word_offset = lookup_label(globals, locals, label)?;
+                let new_offset = word_offset as isize - offset as isize;
                 if let Ok(offset) = (new_offset as SignedStorageInteger).cast_checked() {
-                    ExpandedForm::OneInstruction([BinaryForm::jlp(offset)])
+                    smallvec![BinaryForm::jlp(offset)]
                 } else {
-                    let suffix = BinaryForm::jlr(GP_REG_JUMP_ASSIST, i8::new(0));
-                    match ImmediateLoadForm::new(
+                    let address = MEM_ADDR_ROM_START + (word_offset * 2);
+                    let mut forms = expand_word_immediate_load(
                         GP_REG_JUMP_ASSIST,
-                        target_addr
+                        address
                             .try_into()
                             .map_err(|_| Error::AbsoluteBranchOutOfRange {
                                 label: label.to_owned(),
-                                address: target_addr,
+                                address: word_offset,
                             })?,
-                    ) {
-                        ImmediateLoadForm::Direct(a) => {
-                            ExpandedForm::TwoInstructions([a[0], suffix])
-                        }
-                        ImmediateLoadForm::TwoStage(a) => {
-                            ExpandedForm::ThreeInstructions([a[0], a[1], suffix])
-                        }
-                    }
+                        Some(self.expanded_count as usize - 1),
+                    );
+
+                    forms.push(BinaryForm::jlr(GP_REG_JUMP_ASSIST, 0));
+
+                    forms
                 }
             }
             _ => {
@@ -227,13 +216,14 @@ impl DynamicForm {
                             offset: new_offset,
                         })?,
                 );
-                ExpandedForm::OneInstruction([binary_form])
+
+                smallvec![binary_form]
             }
         };
 
         let old_count = self.expanded_count as usize;
-        let new_count = expanded_form.instruction_count();
-        self.expanded_form = expanded_form;
+        let new_count = expanded_form.len();
+        self.expanded_forms = expanded_form;
         self.expanded_count = new_count as u8;
 
         Ok(new_count != old_count)
@@ -260,7 +250,7 @@ impl Statement {
         match self {
             Statement::BinaryInstruction(f) => buffer.extend(f.value().to_le_bytes()),
             Statement::PendingInstruction(f) => {
-                for f in f.expanded_form.as_slice() {
+                for f in f.expanded_forms.as_slice() {
                     buffer.extend(f.value().to_le_bytes())
                 }
             }
@@ -275,7 +265,7 @@ impl Statement {
 /// - Every `SymbolicForm` is converted to `PendingForm` for further multi-pass iteration later.
 /// - Every `PseudoForm` is expanded into 0 or more `BinaryForm`s.
 impl parser::Statement {
-    fn expand(&self) -> SmallVec<[Statement; 2]> {
+    fn expand(&self) -> SmallVec<[Statement; 3]> {
         match self {
             parser::Statement::BinaryInstruction(f) => {
                 smallvec![Statement::BinaryInstruction(f.to_owned())]
@@ -287,17 +277,10 @@ impl parser::Statement {
             }
             parser::Statement::PseudoInstruction(f) => match f {
                 PseudoForm::Lwi { rd, imm } => {
-                    match ImmediateLoadForm::new(rd.to_owned(), imm.to_owned()) {
-                        ImmediateLoadForm::Direct(a) => {
-                            smallvec![Statement::BinaryInstruction(a[0])]
-                        }
-                        ImmediateLoadForm::TwoStage(a) => {
-                            smallvec![
-                                Statement::BinaryInstruction(a[0]),
-                                Statement::BinaryInstruction(a[1])
-                            ]
-                        }
-                    }
+                    expand_word_immediate_load(rd.to_owned(), imm.to_owned(), None)
+                        .into_iter()
+                        .map(|f| Statement::BinaryInstruction(f))
+                        .collect()
                 }
                 PseudoForm::Ret => {
                     smallvec![Statement::BinaryInstruction(BinaryForm::jpr(GP_REG_LR, 0))]
@@ -426,7 +409,7 @@ impl LocalContext {
             .iter()
             .map(|Spanned { value: i, .. }| match i {
                 Statement::BinaryInstruction(f) => std::slice::from_ref(f),
-                Statement::PendingInstruction(f) => f.expanded_form.as_slice(),
+                Statement::PendingInstruction(f) => f.expanded_forms.as_slice(),
                 Statement::DataDefinition(_) => &[],
             })
             .flat_map(|a| a.iter())
@@ -539,7 +522,7 @@ impl GlobalContext {
             .iter()
             .map(|Spanned { value: i, .. }| match i {
                 Statement::BinaryInstruction(f) => std::slice::from_ref(f),
-                Statement::PendingInstruction(f) => f.expanded_form.as_slice(),
+                Statement::PendingInstruction(f) => f.expanded_forms.as_slice(),
                 Statement::DataDefinition(_) => &[],
             })
             .flat_map(|a| a.iter())
@@ -622,7 +605,7 @@ pub fn assemble(blocks: &[GlobalBlock]) -> Result<Vec<u8>, Spanned<Error>> {
     let mut buffer = vec![];
     context.encode_into(&mut buffer);
 
-    // context.print();
+    context.print();
 
     Ok(buffer)
 }
