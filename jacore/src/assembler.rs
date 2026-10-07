@@ -4,6 +4,7 @@ use crate::parser::{
 };
 use crate::{SignedStorageInteger, Spanned};
 use bilge::prelude::*;
+use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
 
@@ -89,13 +90,6 @@ impl ImmediateLoadForm {
                 BinaryForm::lui(rd, u9::new(imm >> 7)),
                 BinaryForm::adi(rd, u9::new(imm & 0b0000_0000_0111_1111)),
             ])
-        }
-    }
-
-    fn as_slice(&self) -> &[BinaryForm] {
-        match self {
-            ImmediateLoadForm::Direct(a) => a.as_slice(),
-            ImmediateLoadForm::TwoStage(a) => a.as_slice(),
         }
     }
 }
@@ -261,6 +255,58 @@ impl Instruction {
     }
 }
 
+/// Expands from parser's instruction representation to assembler's instruction representation.
+///
+/// - Every `BinaryForm` is simply copied without modification.
+/// - Every `SymbolicForm` is converted to `PendingForm` for further multi-pass iteration later.
+/// - Every `PseudoForm` is expanded into 0 or more `BinaryForm`s.
+impl parser::Instruction {
+    fn expand(&self) -> SmallVec<[Instruction; 2]> {
+        match self {
+            parser::Instruction::BinaryForm(f) => {
+                smallvec![Instruction::BinaryForm(f.to_owned())]
+            }
+            parser::Instruction::SymbolicForm(f) => {
+                smallvec![Instruction::PendingForm(Box::new(
+                    DynamicForm::from_symbolic_form(f)
+                ))]
+            }
+            parser::Instruction::PseudoForm(f) => match f {
+                PseudoForm::Lwi { rd, imm } => {
+                    match ImmediateLoadForm::new(rd.to_owned(), imm.to_owned()) {
+                        ImmediateLoadForm::Direct(a) => {
+                            smallvec![Instruction::BinaryForm(a[0])]
+                        }
+                        ImmediateLoadForm::TwoStage(a) => {
+                            smallvec![Instruction::BinaryForm(a[0]), Instruction::BinaryForm(a[1])]
+                        }
+                    }
+                }
+                PseudoForm::Ret => {
+                    smallvec![Instruction::BinaryForm(BinaryForm::jpr(GP_REG_LR, 0))]
+                }
+            },
+        }
+    }
+}
+
+fn expand_instructions(instructions: &[Spanned<parser::Instruction>]) -> Vec<Spanned<Instruction>> {
+    instructions
+        .iter()
+        .flat_map(
+            |Spanned {
+                 value: instruction,
+                 span,
+             }| {
+                instruction
+                    .expand()
+                    .into_iter()
+                    .map(|i| Spanned::new(i, span.to_owned()))
+            },
+        )
+        .collect()
+}
+
 fn include_label(
     lom: &mut LomTable,
     label: &Spanned<String>,
@@ -279,52 +325,6 @@ fn include_label(
     }
 
     Ok(())
-}
-
-fn transform_instructions(
-    instructions: &[Spanned<parser::Instruction>],
-) -> Vec<Spanned<Instruction>> {
-    let mut output = Vec::with_capacity(instructions.len());
-    for Spanned {
-        value: instruction,
-        span,
-    } in instructions
-    {
-        match instruction {
-            parser::Instruction::BinaryForm(f) => {
-                output.push(Spanned::new(
-                    Instruction::BinaryForm(f.to_owned()),
-                    span.to_owned(),
-                ));
-            }
-            parser::Instruction::SymbolicForm(f) => {
-                output.push(Spanned::new(
-                    Instruction::PendingForm(Box::new(DynamicForm::from_symbolic_form(f))),
-                    span.to_owned(),
-                ));
-            }
-            parser::Instruction::PseudoForm(f) => match f {
-                PseudoForm::Lwi { rd, imm } => {
-                    for binary_form in
-                        ImmediateLoadForm::new(rd.to_owned(), imm.to_owned()).as_slice()
-                    {
-                        output.push(Spanned::new(
-                            Instruction::BinaryForm(binary_form.to_owned()),
-                            span.to_owned(),
-                        ));
-                    }
-                }
-                PseudoForm::Ret => {
-                    output.push(Spanned::new(
-                        Instruction::BinaryForm(BinaryForm::jpr(GP_REG_LR, 0)),
-                        span.to_owned(),
-                    ));
-                }
-            },
-        }
-    }
-
-    output
 }
 
 #[derive(Debug)]
@@ -346,7 +346,7 @@ impl LocalContext {
         include_label(lom, &block.label, base)?;
 
         // Transforms instructions and updates offset
-        let instructions = transform_instructions(&block.instructions);
+        let instructions = expand_instructions(&block.instructions);
         let count = instructions
             .iter()
             .map(|i| i.value.instruction_count())
@@ -437,7 +437,7 @@ impl GlobalContext {
         include_label(lom, &block.label, base)?;
 
         // Transforms instructions and updates offset
-        let instructions = transform_instructions(&block.instructions);
+        let instructions = expand_instructions(&block.instructions);
         let count = instructions
             .iter()
             .map(|i| i.value.instruction_count())
