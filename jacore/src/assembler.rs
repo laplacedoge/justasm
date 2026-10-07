@@ -1,6 +1,6 @@
 use crate::parser::{
-    self, BinaryForm, CheckedCasting, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR, GlobalBlock,
-    LocalBlock, PseudoForm, SymbolicForm,
+    self, BinaryForm, CheckedCasting, DataRepr, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR,
+    GlobalBlock, LocalBlock, PseudoForm, SymbolicForm,
 };
 use crate::{SignedStorageInteger, Spanned};
 use bilge::prelude::*;
@@ -232,25 +232,30 @@ impl DynamicForm {
 }
 
 #[derive(Debug)]
-enum Instruction {
-    BinaryForm(BinaryForm),
-    PendingForm(Box<DynamicForm>),
+enum Statement {
+    BinaryInstruction(BinaryForm),
+    PendingInstruction(Box<DynamicForm>),
+    DataDefinition(DataRepr),
 }
 
-impl Instruction {
-    fn instruction_count(&self) -> usize {
+impl Statement {
+    fn word_count(&self) -> usize {
         match self {
-            Instruction::BinaryForm(_) => 1,
-            Instruction::PendingForm(f) => f.instruction_count(),
+            Statement::BinaryInstruction(_) => 1,
+            Statement::PendingInstruction(f) => f.instruction_count(),
+            Statement::DataDefinition(r) => r.word_count(),
         }
     }
 
     fn encode_into(&self, buffer: &mut Vec<u8>) {
-        for f in match self {
-            Instruction::BinaryForm(f) => std::slice::from_ref(f),
-            Instruction::PendingForm(f) => f.expanded_form.as_slice(),
-        } {
-            buffer.extend(f.value().to_le_bytes());
+        match self {
+            Statement::BinaryInstruction(f) => buffer.extend(f.value().to_le_bytes()),
+            Statement::PendingInstruction(f) => {
+                for f in f.expanded_form.as_slice() {
+                    buffer.extend(f.value().to_le_bytes())
+                }
+            }
+            Statement::DataDefinition(r) => r.encode_into(buffer),
         }
     }
 }
@@ -260,37 +265,43 @@ impl Instruction {
 /// - Every `BinaryForm` is simply copied without modification.
 /// - Every `SymbolicForm` is converted to `PendingForm` for further multi-pass iteration later.
 /// - Every `PseudoForm` is expanded into 0 or more `BinaryForm`s.
-impl parser::Instruction {
-    fn expand(&self) -> SmallVec<[Instruction; 2]> {
+impl parser::Statement {
+    fn expand(&self) -> SmallVec<[Statement; 2]> {
         match self {
-            parser::Instruction::BinaryForm(f) => {
-                smallvec![Instruction::BinaryForm(f.to_owned())]
+            parser::Statement::BinaryInstruction(f) => {
+                smallvec![Statement::BinaryInstruction(f.to_owned())]
             }
-            parser::Instruction::SymbolicForm(f) => {
-                smallvec![Instruction::PendingForm(Box::new(
+            parser::Statement::SymbolicInstruction(f) => {
+                smallvec![Statement::PendingInstruction(Box::new(
                     DynamicForm::from_symbolic_form(f)
                 ))]
             }
-            parser::Instruction::PseudoForm(f) => match f {
+            parser::Statement::PseudoInstruction(f) => match f {
                 PseudoForm::Lwi { rd, imm } => {
                     match ImmediateLoadForm::new(rd.to_owned(), imm.to_owned()) {
                         ImmediateLoadForm::Direct(a) => {
-                            smallvec![Instruction::BinaryForm(a[0])]
+                            smallvec![Statement::BinaryInstruction(a[0])]
                         }
                         ImmediateLoadForm::TwoStage(a) => {
-                            smallvec![Instruction::BinaryForm(a[0]), Instruction::BinaryForm(a[1])]
+                            smallvec![
+                                Statement::BinaryInstruction(a[0]),
+                                Statement::BinaryInstruction(a[1])
+                            ]
                         }
                     }
                 }
                 PseudoForm::Ret => {
-                    smallvec![Instruction::BinaryForm(BinaryForm::jpr(GP_REG_LR, 0))]
+                    smallvec![Statement::BinaryInstruction(BinaryForm::jpr(GP_REG_LR, 0))]
                 }
             },
+            parser::Statement::DataDefinition(r) => {
+                smallvec![Statement::DataDefinition(r.to_owned())]
+            }
         }
     }
 }
 
-fn expand_instructions(instructions: &[Spanned<parser::Instruction>]) -> Vec<Spanned<Instruction>> {
+fn expand_instructions(instructions: &[Spanned<parser::Statement>]) -> Vec<Spanned<Statement>> {
     instructions
         .iter()
         .flat_map(
@@ -332,7 +343,7 @@ pub struct LocalContext {
     label: Spanned<String>,
 
     /// Instructions belonging to this local block.
-    instructions: Vec<Spanned<Instruction>>,
+    statements: Vec<Spanned<Statement>>,
 }
 
 impl LocalContext {
@@ -346,16 +357,16 @@ impl LocalContext {
         include_label(lom, &block.label, base)?;
 
         // Transforms instructions and updates offset
-        let instructions = expand_instructions(&block.instructions);
+        let instructions = expand_instructions(&block.statements);
         let count = instructions
             .iter()
-            .map(|i| i.value.instruction_count())
+            .map(|i| i.value.word_count())
             .sum::<usize>();
         *offset += count;
 
         Ok(Self {
             label: block.label.clone(),
-            instructions,
+            statements: instructions,
         })
     }
 
@@ -369,13 +380,13 @@ impl LocalContext {
         let mut resized = false;
 
         for Spanned {
-            value: instruction,
+            value: statement,
             span,
-        } in &mut self.instructions
+        } in &mut self.statements
         {
-            current += match instruction {
-                Instruction::BinaryForm(_) => 1,
-                Instruction::PendingForm(f) => {
+            current += match statement {
+                Statement::BinaryInstruction(_) => 1,
+                Statement::PendingInstruction(f) => {
                     if f.expand_again(globals, locals, current)
                         .map_err(|e| Spanned::new(e, span.to_owned()))?
                     {
@@ -384,6 +395,7 @@ impl LocalContext {
 
                     f.instruction_count()
                 }
+                Statement::DataDefinition(r) => r.word_count(),
             };
         }
 
@@ -393,7 +405,7 @@ impl LocalContext {
     }
 
     fn encode_into(&self, buffer: &mut Vec<u8>) {
-        self.instructions
+        self.statements
             .iter()
             .for_each(|i| i.value.encode_into(buffer));
     }
@@ -401,11 +413,12 @@ impl LocalContext {
     #[allow(dead_code)]
     fn print(&self) {
         println!("{}:", self.label.value);
-        self.instructions
+        self.statements
             .iter()
             .map(|Spanned { value: i, .. }| match i {
-                Instruction::BinaryForm(f) => std::slice::from_ref(f),
-                Instruction::PendingForm(f) => f.expanded_form.as_slice(),
+                Statement::BinaryInstruction(f) => std::slice::from_ref(f),
+                Statement::PendingInstruction(f) => f.expanded_form.as_slice(),
+                Statement::DataDefinition(_) => &[],
             })
             .flat_map(|a| a.iter())
             .for_each(|f| println!("    {}", f));
@@ -417,7 +430,7 @@ pub struct GlobalContext {
     label: Spanned<String>,
 
     /// Instructions belonging to this global block.
-    instructions: Vec<Spanned<Instruction>>,
+    statements: Vec<Spanned<Statement>>,
 
     /// Local contexts belonging to this global context.
     local_contexts: Vec<LocalContext>,
@@ -437,10 +450,10 @@ impl GlobalContext {
         include_label(lom, &block.label, base)?;
 
         // Transforms instructions and updates offset
-        let instructions = expand_instructions(&block.instructions);
+        let instructions = expand_instructions(&block.statements);
         let count = instructions
             .iter()
-            .map(|i| i.value.instruction_count())
+            .map(|i| i.value.word_count())
             .sum::<usize>();
         *offset += count;
 
@@ -454,7 +467,7 @@ impl GlobalContext {
 
         Ok(Self {
             label: block.label.clone(),
-            instructions,
+            statements: instructions,
             local_contexts,
             local_lom,
         })
@@ -469,13 +482,13 @@ impl GlobalContext {
         let mut resized = false;
 
         for Spanned {
-            value: instruction,
+            value: statement,
             span,
-        } in &mut self.instructions
+        } in &mut self.statements
         {
-            current += match instruction {
-                Instruction::BinaryForm(_) => 1,
-                Instruction::PendingForm(f) => {
+            current += match statement {
+                Statement::BinaryInstruction(_) => 1,
+                Statement::PendingInstruction(f) => {
                     if f.expand_again(globals, &self.local_lom, current)
                         .map_err(|e| Spanned::new(e, span.to_owned()))?
                     {
@@ -484,6 +497,7 @@ impl GlobalContext {
 
                     f.instruction_count()
                 }
+                Statement::DataDefinition(r) => r.word_count(),
             };
         }
 
@@ -501,7 +515,7 @@ impl GlobalContext {
     }
 
     fn encode_into(&self, buffer: &mut Vec<u8>) {
-        self.instructions
+        self.statements
             .iter()
             .for_each(|i| i.value.encode_into(buffer));
         self.local_contexts
@@ -512,11 +526,12 @@ impl GlobalContext {
     #[allow(dead_code)]
     fn print(&self) {
         println!("{}:", self.label.value);
-        self.instructions
+        self.statements
             .iter()
             .map(|Spanned { value: i, .. }| match i {
-                Instruction::BinaryForm(f) => std::slice::from_ref(f),
-                Instruction::PendingForm(f) => f.expanded_form.as_slice(),
+                Statement::BinaryInstruction(f) => std::slice::from_ref(f),
+                Statement::PendingInstruction(f) => f.expanded_form.as_slice(),
+                Statement::DataDefinition(_) => &[],
             })
             .flat_map(|a| a.iter())
             .for_each(|f| println!("    {}", f));

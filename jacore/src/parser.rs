@@ -17,7 +17,7 @@ pub enum Error {
     UnavailableInstruction {
         name: String,
     },
-    UnknownInstruction {
+    UnknownStatement {
         name: String,
     },
     UnknownGpRegister {
@@ -58,8 +58,8 @@ impl std::fmt::Display for Error {
             Error::UnavailableInstruction { name } => {
                 write!(f, "Unavailable instruction '{}'", name)
             }
-            Error::UnknownInstruction { name } => {
-                write!(f, "Unknown instruction '{}'", name)
+            Error::UnknownStatement { name } => {
+                write!(f, "Unknown statement '{}'", name)
             }
             Error::UnknownGpRegister { name } => {
                 write!(f, "Unknown general purpose register '{}'", name)
@@ -567,23 +567,75 @@ pub enum PseudoForm {
     Ret,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataRepr {
+    buffer: Vec<u8>,
+}
+
+impl DataRepr {
+    fn from_bytes<T>(values: T) -> Self
+    where
+        T: IntoIterator<Item = UnsignedStorageInteger>,
+    {
+        Self {
+            buffer: values.into_iter().map(|v| v as u8).collect(),
+        }
+    }
+
+    fn from_words<T>(values: T) -> Self
+    where
+        T: IntoIterator<Item = UnsignedStorageInteger>,
+    {
+        Self {
+            buffer: values
+                .into_iter()
+                .flat_map(|v| (v as u16).to_le_bytes())
+                .collect(),
+        }
+    }
+
+    fn from_dwords<T>(values: T) -> Self
+    where
+        T: IntoIterator<Item = UnsignedStorageInteger>,
+    {
+        Self {
+            buffer: values
+                .into_iter()
+                .flat_map(|v| (v as u32).to_le_bytes())
+                .collect(),
+        }
+    }
+
+    pub fn word_count(&self) -> usize {
+        (self.buffer.len() + 1) >> 1
+    }
+
+    pub fn encode_into(&self, buffer: &mut Vec<u8>) {
+        buffer.extend(&self.buffer);
+        if self.buffer.len() & 1 == 1 {
+            buffer.push(0);
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
-pub enum Instruction {
-    BinaryForm(BinaryForm),
-    SymbolicForm(SymbolicForm),
-    PseudoForm(PseudoForm),
+pub enum Statement {
+    BinaryInstruction(BinaryForm),
+    SymbolicInstruction(SymbolicForm),
+    PseudoInstruction(PseudoForm),
+    DataDefinition(DataRepr),
 }
 
 #[derive(Debug, PartialEq)]
 pub struct LocalBlock {
     pub label: Spanned<String>,
-    pub instructions: Vec<Spanned<Instruction>>,
+    pub statements: Vec<Spanned<Statement>>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct GlobalBlock {
     pub label: Spanned<String>,
-    pub instructions: Vec<Spanned<Instruction>>,
+    pub statements: Vec<Spanned<Statement>>,
     pub local_blocks: Vec<LocalBlock>,
 }
 
@@ -1041,7 +1093,34 @@ impl<'t> Parser<'t> {
         ))
     }
 
-    fn parse_instruction(&mut self) -> Result<Option<Spanned<Instruction>>, Spanned<Error>> {
+    fn parse_data_definition_list(
+        &mut self,
+    ) -> Result<Spanned<Vec<UnsignedStorageInteger>>, Spanned<Error>> {
+        let mut list = vec![];
+
+        let Spanned { value, mut span } = self.consume_integer()?;
+        list.push(value);
+
+        loop {
+            if self.expect_this(&dummy::COMMA, None).is_some() {
+                let Spanned {
+                    value: new_value,
+                    span: new_span,
+                } = self.consume_integer()?;
+
+                list.push(new_value);
+                span = span.merge(&new_span);
+
+                continue;
+            } else {
+                break;
+            }
+        }
+
+        Ok(Spanned::new(list, span))
+    }
+
+    fn parse_statement(&mut self) -> Result<Option<Spanned<Statement>>, Spanned<Error>> {
         self.skip_boundaries();
 
         if let Some((
@@ -1053,38 +1132,38 @@ impl<'t> Parser<'t> {
         )) = self.expect_mnemonic()
         {
             semantic.set(Some(Semantic::Instruction));
-            let (instruction, operand_span) = match name.as_ref() {
+            let (statement, operand_span) = match name.as_ref() {
                 "add" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_ADD)?;
-                    (Instruction::BinaryForm(BinaryForm::Add(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Add(value)), span)
                 }
                 "sub" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_SUB)?;
-                    (Instruction::BinaryForm(BinaryForm::Sub(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Sub(value)), span)
                 }
                 "nor" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_NOR)?;
-                    (Instruction::BinaryForm(BinaryForm::Nor(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Nor(value)), span)
                 }
                 "and" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_AND)?;
-                    (Instruction::BinaryForm(BinaryForm::And(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::And(value)), span)
                 }
                 "xor" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_XOR)?;
-                    (Instruction::BinaryForm(BinaryForm::Xor(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Xor(value)), span)
                 }
                 "lsl" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_LSL)?;
-                    (Instruction::BinaryForm(BinaryForm::Lsl(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Lsl(value)), span)
                 }
                 "lsr" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_LSR)?;
-                    (Instruction::BinaryForm(BinaryForm::Lsr(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Lsr(value)), span)
                 }
                 "asr" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_ASR)?;
-                    (Instruction::BinaryForm(BinaryForm::Asr(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Asr(value)), span)
                 }
 
                 "jpp" | "jlp" | "jpr" | "jlr" => {
@@ -1096,73 +1175,103 @@ impl<'t> Parser<'t> {
 
                 "beq" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Beq(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Beq(label)),
+                        span,
+                    )
                 }
                 "bne" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Bne(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Bne(label)),
+                        span,
+                    )
                 }
                 "bhi" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Bhi(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Bhi(label)),
+                        span,
+                    )
                 }
                 "bgt" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Bgt(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Bgt(label)),
+                        span,
+                    )
                 }
                 "bhs" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Bhs(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Bhs(label)),
+                        span,
+                    )
                 }
                 "bge" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Bge(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Bge(label)),
+                        span,
+                    )
                 }
                 "blo" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Blo(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Blo(label)),
+                        span,
+                    )
                 }
                 "blt" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Blt(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Blt(label)),
+                        span,
+                    )
                 }
                 "bls" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Bls(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Bls(label)),
+                        span,
+                    )
                 }
                 "ble" => {
                     let Spanned { value: label, span } = self.consume_label()?;
-                    (Instruction::SymbolicForm(SymbolicForm::Ble(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Ble(label)),
+                        span,
+                    )
                 }
 
                 "lli" => {
                     let Spanned { value, span } = self.parse_format_d_lli_lui(OPC_LLI)?;
-                    (Instruction::BinaryForm(BinaryForm::Lli(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Lli(value)), span)
                 }
                 "lui" => {
                     let Spanned { value, span } = self.parse_format_d_lli_lui(OPC_LUI)?;
-                    (Instruction::BinaryForm(BinaryForm::Lui(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Lui(value)), span)
                 }
                 "adi" => {
                     let Spanned { value, span } = self.parse_format_d_adi(OPC_ADI)?;
-                    (Instruction::BinaryForm(BinaryForm::Adi(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Adi(value)), span)
                 }
 
                 "ldb" => {
                     let Spanned { value, span } = self.parse_format_e_ld(OPC_LOD, LOD_FN_LDB)?;
-                    (Instruction::BinaryForm(BinaryForm::Ldb(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Ldb(value)), span)
                 }
                 "ldw" => {
                     let Spanned { value, span } = self.parse_format_e_ld(OPC_LOD, LOD_FN_LDW)?;
-                    (Instruction::BinaryForm(BinaryForm::Ldw(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Ldw(value)), span)
                 }
                 "stb" => {
                     let Spanned { value, span } = self.parse_format_e_st(OPC_STR, STR_FN_STB)?;
-                    (Instruction::BinaryForm(BinaryForm::Stb(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Stb(value)), span)
                 }
                 "stw" => {
                     let Spanned { value, span } = self.parse_format_e_st(OPC_STR, STR_FN_STW)?;
-                    (Instruction::BinaryForm(BinaryForm::Stw(value)), span)
+                    (Statement::BinaryInstruction(BinaryForm::Stw(value)), span)
                 }
 
                 // Pseudo instructions
@@ -1170,7 +1279,7 @@ impl<'t> Parser<'t> {
                     semantic.set(Some(Semantic::PseudoInstruction));
 
                     (
-                        Instruction::BinaryForm(BinaryForm::add(GP_REG_0, GP_REG_0, GP_REG_0)),
+                        Statement::BinaryInstruction(BinaryForm::add(GP_REG_0, GP_REG_0, GP_REG_0)),
                         mnemonic_span.clone(),
                     )
                 }
@@ -1185,7 +1294,7 @@ impl<'t> Parser<'t> {
 
                     let new_span = rd.merge_span(&rs);
                     (
-                        Instruction::BinaryForm(BinaryForm::add(rd.value, rs.value, GP_REG_0)),
+                        Statement::BinaryInstruction(BinaryForm::add(rd.value, rs.value, GP_REG_0)),
                         new_span,
                     )
                 }
@@ -1199,7 +1308,7 @@ impl<'t> Parser<'t> {
                     let imm = self.parse_integer::<u16, 16>()?;
 
                     (
-                        Instruction::PseudoForm(PseudoForm::Lwi {
+                        Statement::PseudoInstruction(PseudoForm::Lwi {
                             rd: rd.value,
                             imm: imm.value.as_u16(),
                         }),
@@ -1211,27 +1320,55 @@ impl<'t> Parser<'t> {
 
                     let Spanned { value: label, span } = self.consume_label()?;
 
-                    (Instruction::SymbolicForm(SymbolicForm::Jmp(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Jmp(label)),
+                        span,
+                    )
                 }
                 "cal" => {
                     semantic.set(Some(Semantic::PseudoInstruction));
 
                     let Spanned { value: label, span } = self.consume_label()?;
 
-                    (Instruction::SymbolicForm(SymbolicForm::Cal(label)), span)
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Cal(label)),
+                        span,
+                    )
                 }
                 "ret" => {
                     semantic.set(Some(Semantic::PseudoInstruction));
 
                     (
-                        Instruction::PseudoForm(PseudoForm::Ret),
+                        Statement::PseudoInstruction(PseudoForm::Ret),
                         mnemonic_span.clone(),
+                    )
+                }
+
+                ".byte" => {
+                    let Spanned { value: list, span } = self.parse_data_definition_list()?;
+
+                    (Statement::DataDefinition(DataRepr::from_bytes(list)), span)
+                }
+                ".word" => {
+                    let Spanned { value: list, span } = self.parse_data_definition_list()?;
+
+                    (
+                        Statement::DataDefinition(DataRepr::from_words(list.into_iter())),
+                        span,
+                    )
+                }
+                ".dword" => {
+                    let Spanned { value: list, span } = self.parse_data_definition_list()?;
+
+                    (
+                        Statement::DataDefinition(DataRepr::from_dwords(list.into_iter())),
+                        span,
                     )
                 }
 
                 _ => {
                     return Err(Spanned::new(
-                        Error::UnknownInstruction { name },
+                        Error::UnknownStatement { name },
                         mnemonic_span,
                     ));
                 }
@@ -1240,7 +1377,7 @@ impl<'t> Parser<'t> {
             self.consume_statement_end()?;
 
             return Ok(Some(Spanned::new(
-                instruction,
+                statement,
                 mnemonic_span.merge(&operand_span),
             )));
         }
@@ -1252,19 +1389,16 @@ impl<'t> Parser<'t> {
         self.skip_boundaries();
 
         if let Some(label) = self.expect_local_label() {
-            let mut instructions = vec![];
+            let mut statements = vec![];
             loop {
-                if let Some(instruction) = self.parse_instruction()? {
-                    instructions.push(instruction);
+                if let Some(statement) = self.parse_statement()? {
+                    statements.push(statement);
                 } else {
                     break;
                 }
             }
 
-            return Ok(Some(LocalBlock {
-                label,
-                instructions,
-            }));
+            return Ok(Some(LocalBlock { label, statements }));
         }
 
         Ok(None)
@@ -1274,10 +1408,10 @@ impl<'t> Parser<'t> {
         self.skip_boundaries();
 
         if let Some(label) = self.expect_global_label() {
-            let mut instructions = vec![];
+            let mut statements = vec![];
             loop {
-                if let Some(instruction) = self.parse_instruction()? {
-                    instructions.push(instruction)
+                if let Some(statement) = self.parse_statement()? {
+                    statements.push(statement)
                 } else {
                     break;
                 }
@@ -1294,7 +1428,7 @@ impl<'t> Parser<'t> {
 
             return Ok(Some(GlobalBlock {
                 label,
-                instructions,
+                statements,
                 local_blocks: blocks,
             }));
         }
