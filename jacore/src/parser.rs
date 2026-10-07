@@ -537,6 +537,12 @@ impl std::fmt::Display for BinaryForm {
 /// Jump instructions in which the target is represented by label string
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolicForm {
+    /// Load effective address
+    Lea {
+        rd: u3,
+        label: String,
+    },
+
     /// Unconditional jump
     Jmp(String),
 
@@ -1350,6 +1356,24 @@ impl<'t> Parser<'t> {
                     let span = ra.merge_span(&rb);
                     (
                         Statement::BinaryInstruction(BinaryForm::sub(GP_REG_0, ra.value, rb.value)),
+                        span,
+                    )
+                }
+                "lea" => {
+                    semantic.set(Some(Semantic::PseudoInstruction));
+
+                    let rd = self.consume_gp_register()?;
+
+                    self.consume_this(&dummy::COMMA, None)?;
+
+                    let label = self.consume_label()?;
+
+                    let span = rd.merge_span(&label);
+                    (
+                        Statement::SymbolicInstruction(SymbolicForm::Lea {
+                            rd: rd.value,
+                            label: label.value,
+                        }),
                         span,
                     )
                 }

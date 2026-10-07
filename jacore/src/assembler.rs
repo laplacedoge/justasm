@@ -8,6 +8,8 @@ use smallvec::{SmallVec, smallvec};
 use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
 
+const MEM_ADDR_ROM_START: u16 = 0x2000;
+
 #[derive(Debug, PartialEq)]
 pub enum Error {
     DuplicatedLabel { label: String },
@@ -143,6 +145,13 @@ impl DynamicForm {
         offset: usize,
     ) -> Result<bool, Error> {
         let expanded_form = match &self.symbolic_form {
+            SymbolicForm::Lea { rd, label } => {
+                let address = lookup_label(globals, locals, label)? * 2;
+                match ImmediateLoadForm::new(rd.to_owned(), MEM_ADDR_ROM_START + address as u16) {
+                    ImmediateLoadForm::Direct(a) => ExpandedForm::OneInstruction([a[0]]),
+                    ImmediateLoadForm::TwoStage(a) => ExpandedForm::TwoInstructions([a[0], a[1]]),
+                }
+            }
             SymbolicForm::Jmp(label) => {
                 let target_addr = lookup_label(globals, locals, label)?;
                 let new_offset =
