@@ -1,4 +1,4 @@
-use jacore::{assembler, lexer, parser, preprocessor, scanner};
+use justasm_core::{assembler, lexer, parser, preprocessor, scanner};
 
 use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, Verbosity};

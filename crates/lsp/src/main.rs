@@ -3,8 +3,8 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use jacore::scanner::SourceLayout;
-use jacore::{Spanned, assembler, lexer, parser, preprocessor, scanner};
+use justasm_core::scanner::SourceLayout;
+use justasm_core::{Spanned, assembler, lexer, parser, preprocessor, scanner};
 
 pub const LEGEND_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NAMESPACE, // 0
@@ -116,7 +116,7 @@ impl LanguageServer for Backend {
         self.client
             .log_message(
                 MessageType::INFO,
-                "jad the JustASM LSP server, as your service :)",
+                "lsp the JustASM LSP server, as your service :)",
             )
             .await;
     }
