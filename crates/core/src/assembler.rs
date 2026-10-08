@@ -605,7 +605,7 @@ pub fn assemble(blocks: &[GlobalBlock]) -> Result<Vec<u8>, Spanned<Error>> {
     let mut buffer = vec![];
     context.encode_into(&mut buffer);
 
-    context.print();
+    // context.print();
 
     Ok(buffer)
 }
