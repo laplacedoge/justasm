@@ -1,6 +1,6 @@
 use crate::parser::{
-    self, BinaryForm, CheckedCasting, DataRepr, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR,
-    GlobalBlock, LocalBlock, PseudoForm, SymbolicForm,
+    self, BinaryForm, CheckedCasting, GP_REG_0, GP_REG_JUMP_ASSIST, GP_REG_LR, GlobalBlock,
+    LocalBlock, PseudoForm, SymbolicForm, data_definition,
 };
 use crate::{SignedStorageInteger, Spanned};
 use bilge::prelude::*;
@@ -234,7 +234,7 @@ impl DynamicForm {
 enum Statement {
     BinaryInstruction(BinaryForm),
     PendingInstruction(Box<DynamicForm>),
-    DataDefinition(DataRepr),
+    DataDefinition(data_definition::Data),
 }
 
 impl Statement {

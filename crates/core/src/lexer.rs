@@ -10,6 +10,9 @@ pub enum Error {
     LeadingZero,
     ValidDigitNotFound,
     UnexpectedEos,
+    InvalidStringLiteralChar {
+        c: char,
+    },
     InvalidBinaryDigit {
         c: char,
     },
@@ -44,6 +47,9 @@ impl std::fmt::Display for Error {
             }
             Error::UnexpectedEos => {
                 write!(f, "Unexpected EOS")
+            }
+            Error::InvalidStringLiteralChar { c } => {
+                write!(f, "Invalid string literal character '{}'", c.escape_debug())
             }
             Error::InvalidBinaryDigit { c } => {
                 write!(
@@ -80,6 +86,7 @@ enum State {
     HexadecimalInteger,
     SingleQuote,
     Char,
+    StringLiteral,
     ForwardSlash,
     Comment,
     Hash,
@@ -89,7 +96,8 @@ enum State {
 #[derive(Debug, Clone)]
 pub enum Token {
     Boundary,
-    Integer(UnsignedStorageInteger),
+    NumericLiteral(UnsignedStorageInteger),
+    StringLiteral(String),
     Name(String),
     Label(String),
     Comma,
@@ -106,7 +114,8 @@ pub enum Token {
 pub mod dummy {
     use crate::lexer::Token;
 
-    pub static INTEGER: Token = Token::Integer(0);
+    pub static NUMERIC_LITERAL: Token = Token::NumericLiteral(0);
+    pub static STRING_LITERAL: Token = Token::StringLiteral(String::new());
     pub static NAME: Token = Token::Name(String::new());
     pub static LABEL: Token = Token::Label(String::new());
     pub static COMMA: Token = Token::Comma;
@@ -124,7 +133,8 @@ pub mod dummy {
 impl Token {
     pub fn to_dummy(&self) -> &'static Token {
         match self {
-            Token::Integer(_) => &dummy::INTEGER,
+            Token::NumericLiteral(_) => &dummy::NUMERIC_LITERAL,
+            Token::StringLiteral(_) => &dummy::STRING_LITERAL,
             Token::Name(_) => &dummy::NAME,
             Token::Label(_) => &dummy::LABEL,
             Token::Comma => &dummy::COMMA,
@@ -144,7 +154,8 @@ impl Token {
 impl Token {
     pub fn tag(&self) -> &'static str {
         match self {
-            Token::Integer(_) => "INTEGER",
+            Token::NumericLiteral(_) => "NUMERIC_LITERAL",
+            Token::StringLiteral(_) => "STRING_LITERAL",
             Token::Name(_) => "NAME",
             Token::Label(_) => "LABEL",
             Token::Comma => "','",
@@ -164,7 +175,8 @@ impl Token {
 impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Token::Integer(i) => write!(f, "{}", i),
+            Token::NumericLiteral(i) => write!(f, "{}", i),
+            Token::StringLiteral(s) => write!(f, "\"{}\"", s.escape_debug()),
             Token::Name(s) => write!(f, "Name:\"{}\"", s),
             Token::Label(s) => write!(f, "Label:\"{}\"", s),
             Token::Comma => write!(f, "','"),
@@ -183,11 +195,12 @@ impl std::fmt::Display for Token {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Semantic {
+    NumericLiteral,
+    StringLiteral,
     Label,
     Instruction,
     PseudoInstruction,
     Register,
-    Number,
     Operator,
     Comment,
     Directive,
@@ -197,11 +210,12 @@ pub enum Semantic {
 impl std::fmt::Display for Semantic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Semantic::StringLiteral => write!(f, "StringLiteral"),
+            Semantic::NumericLiteral => write!(f, "NumericLiteral"),
             Semantic::Label => write!(f, "Label"),
             Semantic::Instruction => write!(f, "Instruction"),
             Semantic::PseudoInstruction => write!(f, "PseudoInstruction"),
             Semantic::Register => write!(f, "Register"),
-            Semantic::Number => write!(f, "Number"),
             Semantic::Operator => write!(f, "Operator"),
             Semantic::Comment => write!(f, "Comment"),
             Semantic::Directive => write!(f, "Directive"),
@@ -340,8 +354,20 @@ impl<'s> Lexer<'s> {
         }
     }
 
+    fn pop_integer_buf(&mut self) -> UnsignedStorageInteger {
+        std::mem::take(&mut self.integer_buf)
+    }
+
     fn pop_string_buf(&mut self) -> String {
         std::mem::take(&mut self.string_buf)
+    }
+
+    fn pop_numeric_literal(&mut self) -> Token {
+        Token::NumericLiteral(self.pop_integer_buf())
+    }
+
+    fn pop_string_literal(&mut self) -> Token {
+        Token::StringLiteral(self.pop_string_buf())
     }
 
     fn pop_name(&mut self) -> Token {
@@ -360,20 +386,12 @@ impl<'s> Lexer<'s> {
         Token::Directive(self.pop_string_buf())
     }
 
-    fn pop_integer_buf(&mut self) -> UnsignedStorageInteger {
-        std::mem::take(&mut self.integer_buf)
-    }
-
-    fn pop_integer(&mut self) -> Token {
-        Token::Integer(self.pop_integer_buf())
-    }
-
     fn finalize_prefixed_integer_literal(&mut self) -> Result<Action, Spanned<Error>> {
         if self.num_digits != 0 {
             self.state = State::Start;
             Ok(Action::YieldAndAgain((
-                Token::Integer(self.integer_buf),
-                Some(Semantic::Number),
+                Token::NumericLiteral(self.integer_buf),
+                Some(Semantic::NumericLiteral),
             )))
         } else {
             Err(Spanned::new(
@@ -424,6 +442,10 @@ impl<'s> Lexer<'s> {
                     }
                     '\'' => {
                         self.state = State::SingleQuote;
+                        Ok(Action::Continue)
+                    }
+                    '"' => {
+                        self.state = State::StringLiteral;
                         Ok(Action::Continue)
                     }
                     ',' => Ok(Action::YieldAndContinue((
@@ -523,8 +545,8 @@ impl<'s> Lexer<'s> {
                     _ => {
                         self.state = State::Start;
                         return Ok(Action::YieldAndAgain((
-                            Token::Integer(0),
-                            Some(Semantic::Number),
+                            Token::NumericLiteral(0),
+                            Some(Semantic::NumericLiteral),
                         )));
                     }
                 }
@@ -607,8 +629,8 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
 
                     return Ok(Action::YieldAndContinue((
-                        self.pop_integer(),
-                        Some(Semantic::Number),
+                        self.pop_numeric_literal(),
+                        Some(Semantic::NumericLiteral),
                     )));
                 }
 
@@ -620,6 +642,23 @@ impl<'s> Lexer<'s> {
                     Span::new(self.offset, 1),
                 ))
             }
+            State::StringLiteral => match c {
+                '\0'..='\x1f' | '\x7f'..='\u{9f}' => Err(Spanned::new(
+                    Error::InvalidStringLiteralChar { c },
+                    Span::new(self.offset, 1),
+                )),
+                '"' => {
+                    self.state = State::Start;
+                    Ok(Action::YieldAndContinue((
+                        self.pop_string_literal(),
+                        Some(Semantic::StringLiteral),
+                    )))
+                }
+                _ => {
+                    self.string_buf.push(c);
+                    Ok(Action::Continue)
+                }
+            },
             State::ForwardSlash => {
                 if c == '/' {
                     self.state = State::Comment;
@@ -680,11 +719,20 @@ impl<'s> Lexer<'s> {
         match self.state {
             State::Start | State::Whitespace | State::Boundary => Ok(None),
             State::Name => Ok(Some((self.pop_name(), None))),
-            State::Zero => Ok(Some((Token::Integer(0), Some(Semantic::Number)))),
-            State::DecimalInteger => Ok(Some((self.pop_integer(), Some(Semantic::Number)))),
+            State::Zero => Ok(Some((
+                Token::NumericLiteral(0),
+                Some(Semantic::NumericLiteral),
+            ))),
+            State::DecimalInteger => Ok(Some((
+                self.pop_numeric_literal(),
+                Some(Semantic::NumericLiteral),
+            ))),
             State::BinaryInteger | State::OctalInteger | State::HexadecimalInteger => {
                 if self.num_digits != 0 {
-                    Ok(Some((self.pop_integer(), Some(Semantic::Number))))
+                    Ok(Some((
+                        self.pop_numeric_literal(),
+                        Some(Semantic::NumericLiteral),
+                    )))
                 } else {
                     Err(Spanned::new(
                         Error::ValidDigitNotFound,
@@ -697,6 +745,10 @@ impl<'s> Lexer<'s> {
                 Span::new(self.offset, 0),
             )),
             State::Char => Err(Spanned::new(
+                Error::UnexpectedEos,
+                Span::new(self.offset, 0),
+            )),
+            State::StringLiteral => Err(Spanned::new(
                 Error::UnexpectedEos,
                 Span::new(self.offset, 0),
             )),

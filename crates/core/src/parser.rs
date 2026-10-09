@@ -3,7 +3,7 @@ use crate::{
     SignedStorageInteger, Span, Spanned, UnsignedStorageInteger, format_unexpected_token_error,
 };
 use bilge::prelude::*;
-use num_traits::{AsPrimitive, Unsigned};
+use num_traits::AsPrimitive;
 use std::borrow::Cow;
 use std::ops::{Neg, RangeInclusive};
 
@@ -26,6 +26,10 @@ pub enum Error {
     IntegerLiteralOutOfRange {
         range: RangeInclusive<i64>,
         value: i64,
+    },
+    StringLiteralCharOutOfRange {
+        range: RangeInclusive<i64>,
+        char: char,
     },
     ExpectedStatementEnd {
         unexpected: &'static Token,
@@ -68,6 +72,13 @@ impl std::fmt::Display for Error {
                 write!(
                     f,
                     "Integer literal '{}' is out of the range of {:?}",
+                    value, range
+                )
+            }
+            Error::StringLiteralCharOutOfRange { range, char: value } => {
+                write!(
+                    f,
+                    "String literal character '{}' is out of the range of {:?}",
                     value, range
                 )
             }
@@ -569,100 +580,142 @@ pub enum PseudoForm {
     Ret,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DataRepr {
-    buffer: Vec<u8>,
-}
+pub mod data_definition {
+    use crate::Spanned;
+    use crate::parser::Error;
+    use num_traits::{AsPrimitive, Bounded, ToBytes, Unsigned};
+    use std::ops::RangeInclusive;
 
-impl DataRepr {
-    fn try_from_bytes<T, F>(values: T) -> Result<Self, Spanned<Error>>
+    pub trait EmitTarget
     where
-        T: IntoIterator<Item = Spanned<F>>,
-        F: Unsigned + TryInto<u8> + AsPrimitive<i64>,
+        Self: Unsigned + Bounded + AsPrimitive<u32> + AsPrimitive<i64> + TryFrom<u32> + ToBytes,
     {
-        Ok(Self {
-            buffer: values
-                .into_iter()
-                .map(|Spanned { value: v, span }| {
-                    let s = AsPrimitive::as_(v);
-                    v.try_into().map_err(|_| {
-                        Spanned::new(
-                            Error::integer_literal_out_of_range(
-                                RangeInclusive::from(0..=(u8::MAX as i64)),
-                                s,
-                            ),
-                            span,
-                        )
-                    })
-                })
-                .collect::<Result<Vec<u8>, Spanned<Error>>>()?,
-        })
+        fn value_range() -> RangeInclusive<i64> {
+            RangeInclusive::from(
+                AsPrimitive::as_(Self::min_value())..=AsPrimitive::as_(Self::max_value()),
+            )
+        }
+
+        fn try_from_number(v: u32) -> Result<Self, Error> {
+            match <Self as TryFrom<u32>>::try_from(v) {
+                Ok(i) => Ok(i),
+                Err(_) => Err(Error::IntegerLiteralOutOfRange {
+                    range: Self::value_range(),
+                    value: v as i64,
+                }),
+            }
+        }
+
+        fn try_from_char(c: char) -> Result<Self, Error> {
+            match Self::try_from(AsPrimitive::as_(c)) {
+                Ok(i) => Ok(i),
+                Err(_) => Err(Error::StringLiteralCharOutOfRange {
+                    range: Self::value_range(),
+                    char: c,
+                }),
+            }
+        }
     }
 
-    fn try_from_words<T, F>(values: T) -> Result<Self, Spanned<Error>>
-    where
-        T: IntoIterator<Item = Spanned<F>>,
-        F: Unsigned + TryInto<u16> + AsPrimitive<i64>,
-    {
-        Ok(Self {
-            buffer: {
-                let words = values
-                    .into_iter()
-                    .map(|Spanned { value: v, span }| {
-                        let s = AsPrimitive::as_(v);
-                        v.try_into().map(|v| v.to_le_bytes()).map_err(|_| {
-                            Spanned::new(
-                                Error::integer_literal_out_of_range(
-                                    RangeInclusive::from(0..=(u16::MAX as i64)),
-                                    s,
-                                ),
-                                span,
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+    impl EmitTarget for u8 {}
+    impl EmitTarget for u16 {}
+    impl EmitTarget for u32 {}
 
-                words.into_iter().flatten().collect()
-            },
-        })
+    pub enum Item {
+        Number(u32),
+        Sequence(String),
     }
 
-    fn try_from_dwords<T, F>(values: T) -> Result<Self, Spanned<Error>>
-    where
-        T: IntoIterator<Item = Spanned<F>>,
-        F: Unsigned + TryInto<u32> + AsPrimitive<i64>,
-    {
-        Ok(Self {
-            buffer: {
-                let words = values
-                    .into_iter()
-                    .map(|Spanned { value: v, span }| {
-                        let s = AsPrimitive::as_(v);
-                        v.try_into().map(|v| v.to_le_bytes()).map_err(|_| {
-                            Spanned::new(
-                                Error::integer_literal_out_of_range(
-                                    RangeInclusive::from(0..=(u32::MAX as i64)),
-                                    s,
-                                ),
-                                span,
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+    // pub enum IntoItemIterState {
+    //     Number(std::iter::Once<u32>),
+    //     Sequence(std::vec::IntoIter<u32>),
+    // }
+    //
+    // pub struct IntoItemIter {
+    //     state: IntoItemIterState,
+    // }
+    //
+    // impl Iterator for IntoItemIter {
+    //     type Item = u32;
+    //
+    //     fn next(&mut self) -> Option<Self::Item> {
+    //         match &mut self.state {
+    //             IntoItemIterState::Number(i) => i.next(),
+    //             IntoItemIterState::Sequence(i) => i.next(),
+    //         }
+    //     }
+    //
+    //     fn size_hint(&self) -> (usize, Option<usize>) {
+    //         match &self.state {
+    //             IntoItemIterState::Number(i) => i.size_hint(),
+    //             IntoItemIterState::Sequence(i) => i.size_hint(),
+    //         }
+    //     }
+    // }
+    //
+    // impl ExactSizeIterator for IntoItemIter {}
+    //
+    // impl IntoIterator for Item {
+    //     type Item = u32;
+    //     type IntoIter = IntoItemIter;
+    //
+    //     fn into_iter(self) -> Self::IntoIter {
+    //         let state = match self {
+    //             Item::Number(val) => IntoItemIterState::Number(std::iter::once(val)),
+    //             Item::Sequence(s) => IntoItemIterState::Sequence(
+    //                 s.chars().map(|c| c as u32).collect::<Vec<_>>().into_iter(),
+    //             ),
+    //         };
+    //         IntoItemIter { state }
+    //     }
+    // }
 
-                words.into_iter().flatten().collect()
-            },
-        })
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Data {
+        buffer: Vec<u8>,
     }
 
-    pub fn word_count(&self) -> usize {
-        (self.buffer.len() + 1) >> 1
-    }
+    impl Data {
+        pub fn try_from_items<T, F>(items: T) -> Result<Self, Spanned<Error>>
+        where
+            T: IntoIterator<Item = Spanned<Item>>,
+            // F: Unsigned + Bounded + AsPrimitive<u32> + AsPrimitive<i64> + TryFrom<u32>,
+            F: EmitTarget,
+        {
+            let mut integers = vec![];
+            for Spanned { value: item, span } in items {
+                match item {
+                    Item::Number(i) => {
+                        let integer = F::try_from_number(i).map_err(|e| Spanned::new(e, span))?;
+                        integers.push(integer);
+                    }
+                    Item::Sequence(s) => {
+                        for c in s.chars() {
+                            let integer = F::try_from_char(c)
+                                .map_err(|e| Spanned::new(e, span.to_owned()))?;
+                            integers.push(integer);
+                        }
+                    }
+                }
+            }
 
-    pub fn encode_into(&self, buffer: &mut Vec<u8>) {
-        buffer.extend(&self.buffer);
-        if self.buffer.len() & 1 == 1 {
-            buffer.push(0);
+            let mut buffer = vec![];
+            for integer in integers {
+                buffer.extend(integer.to_le_bytes().as_ref());
+            }
+
+            Ok(Self { buffer })
+        }
+
+        pub fn word_count(&self) -> usize {
+            (self.buffer.len() + 1) >> 1
+        }
+
+        pub fn encode_into(&self, buffer: &mut Vec<u8>) {
+            buffer.extend(&self.buffer);
+            if self.buffer.len() & 1 == 1 {
+                buffer.push(0);
+            }
         }
     }
 }
@@ -672,7 +725,7 @@ pub enum Statement {
     BinaryInstruction(BinaryForm),
     SymbolicInstruction(SymbolicForm),
     PseudoInstruction(PseudoForm),
-    DataDefinition(DataRepr),
+    DataDefinition(data_definition::Data),
 }
 
 #[derive(Debug, PartialEq)]
@@ -805,6 +858,43 @@ impl<'t> Parser<'t> {
         self.consume_any(&[(token, semantic)])
     }
 
+    fn consume_numeric_literal(
+        &mut self,
+    ) -> Result<Spanned<UnsignedStorageInteger>, Spanned<Error>> {
+        self.consume_this(&dummy::NUMERIC_LITERAL, None).map(|s| {
+            s.map(|t| match t {
+                Token::NumericLiteral(i) => i.to_owned(),
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            })
+        })
+    }
+
+    #[allow(dead_code)]
+    fn consume_string_literal(&mut self) -> Result<Spanned<String>, Spanned<Error>> {
+        self.consume_this(&dummy::STRING_LITERAL, None).map(|s| {
+            s.map(|t| match t {
+                Token::StringLiteral(s) => s.to_owned(),
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            })
+        })
+    }
+
+    fn consume_data_definition_item(
+        &mut self,
+    ) -> Result<Spanned<data_definition::Item>, Spanned<Error>> {
+        self.consume_any(&[
+            (&dummy::NUMERIC_LITERAL, None),
+            (&dummy::STRING_LITERAL, None),
+        ])
+        .map(|s| {
+            s.map(|t| match t {
+                Token::NumericLiteral(i) => data_definition::Item::Number(i.to_owned() as u32),
+                Token::StringLiteral(s) => data_definition::Item::Sequence(s.to_owned()),
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            })
+        })
+    }
+
     #[allow(dead_code)]
     fn consume_name(
         &mut self,
@@ -874,29 +964,6 @@ impl<'t> Parser<'t> {
         }
 
         None
-    }
-
-    fn consume_integer(&mut self) -> Result<Spanned<UnsignedStorageInteger>, Spanned<Error>> {
-        if let Some(Spanned {
-            value: SemanticToken { value: token, .. },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if let Token::Integer(value) = token {
-                self.offset += 1;
-                return Ok(Spanned::new(*value, span.to_owned()));
-            }
-
-            return Err(Spanned::new(
-                Error::unexpected_token(&dummy::INTEGER, vec![token.to_dummy()]),
-                span.clone(),
-            ));
-        }
-
-        Err(Spanned::new(
-            Error::UnexpectedEos,
-            Span::new(self.source_len, 0),
-        ))
     }
 
     fn consume_statement_end(&mut self) -> Result<(), Spanned<Error>> {
@@ -1000,7 +1067,7 @@ impl<'t> Parser<'t> {
         let Spanned {
             value: magnitude,
             span,
-        } = self.consume_integer()?;
+        } = self.consume_numeric_literal()?;
         let value = magnitude.cast_checked().map_err(|e| {
             Spanned::new(
                 Error::integer_literal_out_of_range(e.range, e.value),
@@ -1034,7 +1101,7 @@ impl<'t> Parser<'t> {
         let Spanned {
             value: magnitude,
             span: value_span,
-        } = self.consume_integer()?;
+        } = self.consume_numeric_literal()?;
         let new_span = match sign_span {
             Some(s) => s.merge(&value_span),
             None => value_span,
@@ -1144,17 +1211,17 @@ impl<'t> Parser<'t> {
 
     fn parse_data_definition_list(
         &mut self,
-    ) -> Result<(Vec<Spanned<UnsignedStorageInteger>>, Span), Spanned<Error>> {
+    ) -> Result<(Vec<Spanned<data_definition::Item>>, Span), Spanned<Error>> {
         let mut list = vec![];
         let mut span;
 
-        let value = self.consume_integer()?;
+        let value = self.consume_data_definition_item()?;
         span = value.span.clone();
         list.push(value);
 
         loop {
             if self.expect_this(&dummy::COMMA, None).is_some() {
-                let value = self.consume_integer()?;
+                let value = self.consume_data_definition_item()?;
                 span = span.merge(&value.span);
                 list.push(value);
                 continue;
@@ -1427,7 +1494,9 @@ impl<'t> Parser<'t> {
                     let (list, span) = self.parse_data_definition_list()?;
 
                     (
-                        Statement::DataDefinition(DataRepr::try_from_bytes(list)?),
+                        Statement::DataDefinition(data_definition::Data::try_from_items::<_, u8>(
+                            list,
+                        )?),
                         span,
                     )
                 }
@@ -1435,7 +1504,9 @@ impl<'t> Parser<'t> {
                     let (list, span) = self.parse_data_definition_list()?;
 
                     (
-                        Statement::DataDefinition(DataRepr::try_from_words(list)?),
+                        Statement::DataDefinition(data_definition::Data::try_from_items::<_, u16>(
+                            list,
+                        )?),
                         span,
                     )
                 }
@@ -1443,7 +1514,9 @@ impl<'t> Parser<'t> {
                     let (list, span) = self.parse_data_definition_list()?;
 
                     (
-                        Statement::DataDefinition(DataRepr::try_from_dwords(list)?),
+                        Statement::DataDefinition(data_definition::Data::try_from_items::<_, u32>(
+                            list,
+                        )?),
                         span,
                     )
                 }

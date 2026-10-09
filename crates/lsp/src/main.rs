@@ -15,6 +15,7 @@ pub const LEGEND_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NUMBER,    // 5
     SemanticTokenType::OPERATOR,  // 6
     SemanticTokenType::COMMENT,   // 7
+    SemanticTokenType::STRING,    // 8
 ];
 
 trait SemanticLegend {
@@ -26,11 +27,12 @@ impl SemanticLegend for Option<lexer::Semantic> {
         match self {
             None => 0,
             Some(s) => match s {
+                lexer::Semantic::StringLiteral => 8,
+                lexer::Semantic::NumericLiteral => 5,
                 lexer::Semantic::Label => 1,
                 lexer::Semantic::Instruction => 2,
                 lexer::Semantic::PseudoInstruction => 3,
                 lexer::Semantic::Register => 4,
-                lexer::Semantic::Number => 5,
                 lexer::Semantic::Operator => 6,
                 lexer::Semantic::Comment => 7,
                 lexer::Semantic::Directive => 2,

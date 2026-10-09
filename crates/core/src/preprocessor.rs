@@ -41,7 +41,8 @@ impl std::error::Error for Error {}
 
 enum Replaceable {
     Name(String),
-    Integer(UnsignedStorageInteger),
+    NumericLiteral(UnsignedStorageInteger),
+    StringLiteral(String),
 }
 
 struct Preprocessor<'s> {
@@ -153,12 +154,14 @@ impl<'s> Preprocessor<'s> {
         let value = self
             .consume_any(&[
                 (&dummy::NAME, Semantic::Alias),
-                (&dummy::INTEGER, Semantic::Number),
+                (&dummy::NUMERIC_LITERAL, Semantic::NumericLiteral),
+                (&dummy::STRING_LITERAL, Semantic::StringLiteral),
             ])?
             .map(|t| unsafe {
                 match t {
-                    Token::Name(name) => Replaceable::Name(name.to_owned()),
-                    Token::Integer(value) => Replaceable::Integer(value.to_owned()),
+                    Token::Name(s) => Replaceable::Name(s.to_owned()),
+                    Token::NumericLiteral(i) => Replaceable::NumericLiteral(i.to_owned()),
+                    Token::StringLiteral(s) => Replaceable::StringLiteral(s.to_owned()),
                     _ => std::hint::unreachable_unchecked(),
                 }
             });
@@ -192,9 +195,12 @@ impl<'s> Preprocessor<'s> {
 
             let span = token.span.to_owned();
             let token = match replaceable {
-                Replaceable::Name(name) => SemanticToken::new(Token::Name(name.to_owned()), None),
-                Replaceable::Integer(value) => {
-                    SemanticToken::new(Token::Integer(value.to_owned()), None)
+                Replaceable::Name(s) => SemanticToken::new(Token::Name(s.to_owned()), None),
+                Replaceable::NumericLiteral(i) => {
+                    SemanticToken::new(Token::NumericLiteral(i.to_owned()), None)
+                }
+                Replaceable::StringLiteral(s) => {
+                    SemanticToken::new(Token::StringLiteral(s.to_owned()), None)
                 }
             };
 
