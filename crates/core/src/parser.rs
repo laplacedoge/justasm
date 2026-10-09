@@ -588,7 +588,13 @@ pub mod data_definition {
 
     pub trait EmitTarget
     where
-        Self: Unsigned + Bounded + AsPrimitive<u32> + AsPrimitive<i64> + TryFrom<u32> + ToBytes,
+        Self: Unsigned
+            + Bounded
+            + AsPrimitive<u32>
+            + AsPrimitive<i64>
+            + TryFrom<u32>
+            + From<u8>
+            + ToBytes,
     {
         fn value_range() -> RangeInclusive<i64> {
             RangeInclusive::from(
@@ -623,52 +629,9 @@ pub mod data_definition {
 
     pub enum Item {
         Number(u32),
-        Sequence(String),
+        UnicodeSequence(String),
+        ByteSequence(String),
     }
-
-    // pub enum IntoItemIterState {
-    //     Number(std::iter::Once<u32>),
-    //     Sequence(std::vec::IntoIter<u32>),
-    // }
-    //
-    // pub struct IntoItemIter {
-    //     state: IntoItemIterState,
-    // }
-    //
-    // impl Iterator for IntoItemIter {
-    //     type Item = u32;
-    //
-    //     fn next(&mut self) -> Option<Self::Item> {
-    //         match &mut self.state {
-    //             IntoItemIterState::Number(i) => i.next(),
-    //             IntoItemIterState::Sequence(i) => i.next(),
-    //         }
-    //     }
-    //
-    //     fn size_hint(&self) -> (usize, Option<usize>) {
-    //         match &self.state {
-    //             IntoItemIterState::Number(i) => i.size_hint(),
-    //             IntoItemIterState::Sequence(i) => i.size_hint(),
-    //         }
-    //     }
-    // }
-    //
-    // impl ExactSizeIterator for IntoItemIter {}
-    //
-    // impl IntoIterator for Item {
-    //     type Item = u32;
-    //     type IntoIter = IntoItemIter;
-    //
-    //     fn into_iter(self) -> Self::IntoIter {
-    //         let state = match self {
-    //             Item::Number(val) => IntoItemIterState::Number(std::iter::once(val)),
-    //             Item::Sequence(s) => IntoItemIterState::Sequence(
-    //                 s.chars().map(|c| c as u32).collect::<Vec<_>>().into_iter(),
-    //             ),
-    //         };
-    //         IntoItemIter { state }
-    //     }
-    // }
 
     #[derive(Debug, Clone, PartialEq)]
     pub struct Data {
@@ -679,7 +642,6 @@ pub mod data_definition {
         pub fn try_from_items<T, F>(items: T) -> Result<Self, Spanned<Error>>
         where
             T: IntoIterator<Item = Spanned<Item>>,
-            // F: Unsigned + Bounded + AsPrimitive<u32> + AsPrimitive<i64> + TryFrom<u32>,
             F: EmitTarget,
         {
             let mut integers = vec![];
@@ -689,11 +651,16 @@ pub mod data_definition {
                         let integer = F::try_from_number(i).map_err(|e| Spanned::new(e, span))?;
                         integers.push(integer);
                     }
-                    Item::Sequence(s) => {
+                    Item::UnicodeSequence(s) => {
                         for c in s.chars() {
                             let integer = F::try_from_char(c)
                                 .map_err(|e| Spanned::new(e, span.to_owned()))?;
                             integers.push(integer);
+                        }
+                    }
+                    Item::ByteSequence(s) => {
+                        for b in s.bytes() {
+                            integers.push(F::from(b));
                         }
                     }
                 }
@@ -869,27 +836,21 @@ impl<'t> Parser<'t> {
         })
     }
 
-    #[allow(dead_code)]
-    fn consume_string_literal(&mut self) -> Result<Spanned<String>, Spanned<Error>> {
-        self.consume_this(&dummy::STRING_LITERAL, None).map(|s| {
-            s.map(|t| match t {
-                Token::StringLiteral(s) => s.to_owned(),
-                _ => unsafe { std::hint::unreachable_unchecked() },
-            })
-        })
-    }
-
     fn consume_data_definition_item(
         &mut self,
     ) -> Result<Spanned<data_definition::Item>, Spanned<Error>> {
         self.consume_any(&[
             (&dummy::NUMERIC_LITERAL, None),
-            (&dummy::STRING_LITERAL, None),
+            (&dummy::UNICODE_STRING_LITERAL, None),
+            (&dummy::BYTE_STRING_LITERAL, None),
         ])
         .map(|s| {
             s.map(|t| match t {
                 Token::NumericLiteral(i) => data_definition::Item::Number(i.to_owned() as u32),
-                Token::StringLiteral(s) => data_definition::Item::Sequence(s.to_owned()),
+                Token::UnicodeStringLiteral(s) => {
+                    data_definition::Item::UnicodeSequence(s.to_owned())
+                }
+                Token::ByteStringLiteral(s) => data_definition::Item::ByteSequence(s.to_owned()),
                 _ => unsafe { std::hint::unreachable_unchecked() },
             })
         })

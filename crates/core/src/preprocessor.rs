@@ -155,13 +155,13 @@ impl<'s> Preprocessor<'s> {
             .consume_any(&[
                 (&dummy::NAME, Semantic::Alias),
                 (&dummy::NUMERIC_LITERAL, Semantic::NumericLiteral),
-                (&dummy::STRING_LITERAL, Semantic::StringLiteral),
+                (&dummy::UNICODE_STRING_LITERAL, Semantic::StringLiteral),
             ])?
             .map(|t| unsafe {
                 match t {
                     Token::Name(s) => Replaceable::Name(s.to_owned()),
                     Token::NumericLiteral(i) => Replaceable::NumericLiteral(i.to_owned()),
-                    Token::StringLiteral(s) => Replaceable::StringLiteral(s.to_owned()),
+                    Token::UnicodeStringLiteral(s) => Replaceable::StringLiteral(s.to_owned()),
                     _ => std::hint::unreachable_unchecked(),
                 }
             });
@@ -200,7 +200,7 @@ impl<'s> Preprocessor<'s> {
                     SemanticToken::new(Token::NumericLiteral(i.to_owned()), None)
                 }
                 Replaceable::StringLiteral(s) => {
-                    SemanticToken::new(Token::StringLiteral(s.to_owned()), None)
+                    SemanticToken::new(Token::UnicodeStringLiteral(s.to_owned()), None)
                 }
             };
 

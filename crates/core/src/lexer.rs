@@ -75,9 +75,11 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 enum State {
+    Start,
     Whitespace,
     Boundary,
-    Start,
+    UPrefix,
+    BPrefix,
     Name,
     Zero,
     BinaryInteger,
@@ -86,7 +88,8 @@ enum State {
     HexadecimalInteger,
     SingleQuote,
     Char,
-    StringLiteral,
+    UnicodeStringLiteral,
+    ByteStringLiteral,
     ForwardSlash,
     Comment,
     Hash,
@@ -97,7 +100,8 @@ enum State {
 pub enum Token {
     Boundary,
     NumericLiteral(UnsignedStorageInteger),
-    StringLiteral(String),
+    UnicodeStringLiteral(String),
+    ByteStringLiteral(String),
     Name(String),
     Label(String),
     Comma,
@@ -115,7 +119,8 @@ pub mod dummy {
     use crate::lexer::Token;
 
     pub static NUMERIC_LITERAL: Token = Token::NumericLiteral(0);
-    pub static STRING_LITERAL: Token = Token::StringLiteral(String::new());
+    pub static UNICODE_STRING_LITERAL: Token = Token::UnicodeStringLiteral(String::new());
+    pub static BYTE_STRING_LITERAL: Token = Token::ByteStringLiteral(String::new());
     pub static NAME: Token = Token::Name(String::new());
     pub static LABEL: Token = Token::Label(String::new());
     pub static COMMA: Token = Token::Comma;
@@ -134,7 +139,8 @@ impl Token {
     pub fn to_dummy(&self) -> &'static Token {
         match self {
             Token::NumericLiteral(_) => &dummy::NUMERIC_LITERAL,
-            Token::StringLiteral(_) => &dummy::STRING_LITERAL,
+            Token::UnicodeStringLiteral(_) => &dummy::UNICODE_STRING_LITERAL,
+            Token::ByteStringLiteral(_) => &dummy::BYTE_STRING_LITERAL,
             Token::Name(_) => &dummy::NAME,
             Token::Label(_) => &dummy::LABEL,
             Token::Comma => &dummy::COMMA,
@@ -155,7 +161,8 @@ impl Token {
     pub fn tag(&self) -> &'static str {
         match self {
             Token::NumericLiteral(_) => "NUMERIC_LITERAL",
-            Token::StringLiteral(_) => "STRING_LITERAL",
+            Token::UnicodeStringLiteral(_) => "UNICODE_STRING_LITERAL",
+            Token::ByteStringLiteral(_) => "BYTE_STRING_LITERAL",
             Token::Name(_) => "NAME",
             Token::Label(_) => "LABEL",
             Token::Comma => "','",
@@ -176,7 +183,8 @@ impl std::fmt::Display for Token {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Token::NumericLiteral(i) => write!(f, "{}", i),
-            Token::StringLiteral(s) => write!(f, "\"{}\"", s.escape_debug()),
+            Token::UnicodeStringLiteral(s) => write!(f, "u\"{}\"", s.escape_debug()),
+            Token::ByteStringLiteral(s) => write!(f, "b\"{}\"", s.escape_debug()),
             Token::Name(s) => write!(f, "Name:\"{}\"", s),
             Token::Label(s) => write!(f, "Label:\"{}\"", s),
             Token::Comma => write!(f, "','"),
@@ -277,17 +285,29 @@ trait LexerChar {
     fn into_hexadecimal_digit(self) -> Result<Option<usize>, Error>;
 }
 
+macro_rules! ident_first_char_pattern {
+    () => {
+        '_' | 'A'..='Z' | 'a'..='z'
+    };
+}
+
+macro_rules! ident_other_char_pattern {
+    () => {
+        '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'
+    };
+}
+
 impl LexerChar for char {
     fn is_whitespace_char(&self) -> bool {
         matches!(self, ' ' | '\r' | '\n')
     }
 
     fn is_identifier_first_char(&self) -> bool {
-        matches!(self, '_' | 'A'..='Z' | 'a'..='z')
+        matches!(self, ident_first_char_pattern!())
     }
 
     fn is_identifier_other_char(&self) -> bool {
-        matches!(self, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9')
+        matches!(self, ident_other_char_pattern!())
     }
 
     fn into_binary_digit(self) -> Result<Option<usize>, Error> {
@@ -366,8 +386,12 @@ impl<'s> Lexer<'s> {
         Token::NumericLiteral(self.pop_integer_buf())
     }
 
-    fn pop_string_literal(&mut self) -> Token {
-        Token::StringLiteral(self.pop_string_buf())
+    fn pop_unicode_string_literal(&mut self) -> Token {
+        Token::UnicodeStringLiteral(self.pop_string_buf())
+    }
+
+    fn pop_byte_string_literal(&mut self) -> Token {
+        Token::ByteStringLiteral(self.pop_string_buf())
     }
 
     fn pop_name(&mut self) -> Token {
@@ -417,6 +441,16 @@ impl<'s> Lexer<'s> {
                     return Ok(Action::Continue);
                 }
 
+                if matches!(c, 'u') {
+                    self.state = State::UPrefix;
+                    return Ok(Action::Continue);
+                }
+
+                if matches!(c, 'b') {
+                    self.state = State::BPrefix;
+                    return Ok(Action::Continue);
+                }
+
                 if c.is_identifier_first_char() {
                     self.string_buf.push(c);
                     self.state = State::Name;
@@ -445,7 +479,7 @@ impl<'s> Lexer<'s> {
                         Ok(Action::Continue)
                     }
                     '"' => {
-                        self.state = State::StringLiteral;
+                        self.state = State::UnicodeStringLiteral;
                         Ok(Action::Continue)
                     }
                     ',' => Ok(Action::YieldAndContinue((
@@ -517,6 +551,52 @@ impl<'s> Lexer<'s> {
                 self.state = State::Start;
                 Ok(Action::YieldAndAgain((Token::Boundary, None)))
             }
+            State::UPrefix => match c {
+                '"' => {
+                    self.state = State::UnicodeStringLiteral;
+                    Ok(Action::Continue)
+                }
+                ':' => {
+                    self.state = State::Start;
+                    Ok(Action::YieldAndContinue((
+                        Token::Label('u'.into()),
+                        Some(Semantic::Label),
+                    )))
+                }
+                ident_other_char_pattern!() => {
+                    self.string_buf.push('u');
+                    self.string_buf.push(c);
+                    self.state = State::Name;
+                    Ok(Action::Continue)
+                }
+                _ => {
+                    self.state = State::Start;
+                    Ok(Action::YieldAndAgain((Token::Name('u'.into()), None)))
+                }
+            },
+            State::BPrefix => match c {
+                '"' => {
+                    self.state = State::ByteStringLiteral;
+                    Ok(Action::Continue)
+                }
+                ':' => {
+                    self.state = State::Start;
+                    Ok(Action::YieldAndContinue((
+                        Token::Label('b'.into()),
+                        Some(Semantic::Label),
+                    )))
+                }
+                ident_other_char_pattern!() => {
+                    self.string_buf.push('b');
+                    self.string_buf.push(c);
+                    self.state = State::Name;
+                    Ok(Action::Continue)
+                }
+                _ => {
+                    self.state = State::Start;
+                    Ok(Action::YieldAndAgain((Token::Name('b'.into()), None)))
+                }
+            },
             State::Name => {
                 if c.is_identifier_other_char() {
                     self.string_buf.push(c);
@@ -642,7 +722,7 @@ impl<'s> Lexer<'s> {
                     Span::new(self.offset, 1),
                 ))
             }
-            State::StringLiteral => match c {
+            State::UnicodeStringLiteral => match c {
                 '\0'..='\x1f' | '\x7f'..='\u{9f}' => Err(Spanned::new(
                     Error::InvalidStringLiteralChar { c },
                     Span::new(self.offset, 1),
@@ -650,7 +730,24 @@ impl<'s> Lexer<'s> {
                 '"' => {
                     self.state = State::Start;
                     Ok(Action::YieldAndContinue((
-                        self.pop_string_literal(),
+                        self.pop_unicode_string_literal(),
+                        Some(Semantic::StringLiteral),
+                    )))
+                }
+                _ => {
+                    self.string_buf.push(c);
+                    Ok(Action::Continue)
+                }
+            },
+            State::ByteStringLiteral => match c {
+                '\0'..='\x1f' | '\x7f'..='\u{9f}' => Err(Spanned::new(
+                    Error::InvalidStringLiteralChar { c },
+                    Span::new(self.offset, 1),
+                )),
+                '"' => {
+                    self.state = State::Start;
+                    Ok(Action::YieldAndContinue((
+                        self.pop_byte_string_literal(),
                         Some(Semantic::StringLiteral),
                     )))
                 }
@@ -718,6 +815,8 @@ impl<'s> Lexer<'s> {
     fn feed_eos(&mut self) -> Result<Option<(Token, Option<Semantic>)>, Spanned<Error>> {
         match self.state {
             State::Start | State::Whitespace | State::Boundary => Ok(None),
+            State::UPrefix => Ok(Some((Token::Name('u'.into()), None))),
+            State::BPrefix => Ok(Some((Token::Name('b'.into()), None))),
             State::Name => Ok(Some((self.pop_name(), None))),
             State::Zero => Ok(Some((
                 Token::NumericLiteral(0),
@@ -740,28 +839,17 @@ impl<'s> Lexer<'s> {
                     ))
                 }
             }
-            State::SingleQuote => Err(Spanned::new(
-                Error::UnexpectedEos,
-                Span::new(self.offset, 0),
-            )),
-            State::Char => Err(Spanned::new(
-                Error::UnexpectedEos,
-                Span::new(self.offset, 0),
-            )),
-            State::StringLiteral => Err(Spanned::new(
-                Error::UnexpectedEos,
-                Span::new(self.offset, 0),
-            )),
-            State::ForwardSlash => Err(Spanned::new(
-                Error::UnexpectedEos,
-                Span::new(self.offset, 0),
-            )),
             State::Comment => Ok(Some((self.pop_comment(), Some(Semantic::Comment)))),
-            State::Hash => Err(Spanned::new(
+            State::Directive => Ok(Some((self.pop_directive(), Some(Semantic::Directive)))),
+            State::SingleQuote
+            | State::Char
+            | State::UnicodeStringLiteral
+            | State::ByteStringLiteral
+            | State::ForwardSlash
+            | State::Hash => Err(Spanned::new(
                 Error::UnexpectedEos,
                 Span::new(self.offset, 0),
             )),
-            State::Directive => Ok(Some((self.pop_directive(), Some(Semantic::Directive)))),
         }
     }
 
