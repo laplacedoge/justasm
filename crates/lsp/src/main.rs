@@ -22,21 +22,21 @@ trait SemanticLegend {
     fn to_legend(&self) -> u32;
 }
 
-impl SemanticLegend for Option<lexer::Semantic> {
+impl SemanticLegend for Option<lexer::Meaning> {
     fn to_legend(&self) -> u32 {
         match self {
             None => 0,
             Some(s) => match s {
-                lexer::Semantic::StringLiteral => 8,
-                lexer::Semantic::NumericLiteral => 5,
-                lexer::Semantic::Label => 1,
-                lexer::Semantic::Instruction => 2,
-                lexer::Semantic::PseudoInstruction => 3,
-                lexer::Semantic::Register => 4,
-                lexer::Semantic::Operator => 6,
-                lexer::Semantic::Comment => 7,
-                lexer::Semantic::Directive => 2,
-                lexer::Semantic::Alias => 3,
+                lexer::Meaning::StringLiteral => 8,
+                lexer::Meaning::NumericLiteral => 5,
+                lexer::Meaning::Label => 1,
+                lexer::Meaning::Instruction => 2,
+                lexer::Meaning::PseudoInstruction => 3,
+                lexer::Meaning::Register => 4,
+                lexer::Meaning::Operator => 6,
+                lexer::Meaning::Comment => 7,
+                lexer::Meaning::Directive => 2,
+                lexer::Meaning::Alias => 3,
             },
         }
     }
@@ -213,9 +213,9 @@ fn analyze_source(source: String) -> (AnalyzedSource, Vec<Diagnostic>) {
     let mut last_start_char = 0;
 
     for Spanned {
-        value: lexer::SemanticToken {
+        value: lexer::Semantic {
             value: token,
-            semantic,
+            meaning,
         },
         span,
     } in &tokens
@@ -235,7 +235,7 @@ fn analyze_source(source: String) -> (AnalyzedSource, Vec<Diagnostic>) {
                     delta_line: delta_line as u32,
                     delta_start: delta_start_char as u32,
                     length: span.length as u32,
-                    token_type: semantic.get().to_legend(),
+                    token_type: meaning.get().to_legend(),
                     token_modifiers_bitset: 0,
                 });
 

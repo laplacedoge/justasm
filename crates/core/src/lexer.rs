@@ -202,7 +202,7 @@ impl std::fmt::Display for Token {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum Semantic {
+pub enum Meaning {
     NumericLiteral,
     StringLiteral,
     Label,
@@ -215,57 +215,78 @@ pub enum Semantic {
     Alias,
 }
 
-impl std::fmt::Display for Semantic {
+impl std::fmt::Display for Meaning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Semantic::StringLiteral => write!(f, "StringLiteral"),
-            Semantic::NumericLiteral => write!(f, "NumericLiteral"),
-            Semantic::Label => write!(f, "Label"),
-            Semantic::Instruction => write!(f, "Instruction"),
-            Semantic::PseudoInstruction => write!(f, "PseudoInstruction"),
-            Semantic::Register => write!(f, "Register"),
-            Semantic::Operator => write!(f, "Operator"),
-            Semantic::Comment => write!(f, "Comment"),
-            Semantic::Directive => write!(f, "Directive"),
-            Semantic::Alias => write!(f, "Alias"),
+            Meaning::StringLiteral => write!(f, "StringLiteral"),
+            Meaning::NumericLiteral => write!(f, "NumericLiteral"),
+            Meaning::Label => write!(f, "Label"),
+            Meaning::Instruction => write!(f, "Instruction"),
+            Meaning::PseudoInstruction => write!(f, "PseudoInstruction"),
+            Meaning::Register => write!(f, "Register"),
+            Meaning::Operator => write!(f, "Operator"),
+            Meaning::Comment => write!(f, "Comment"),
+            Meaning::Directive => write!(f, "Directive"),
+            Meaning::Alias => write!(f, "Alias"),
         }
     }
 }
 
-/// Annotated token
 #[derive(Debug, Clone)]
-pub struct SemanticToken {
-    pub value: Token,
-    pub semantic: Cell<Option<Semantic>>,
+pub struct Semantic<T> {
+    pub value: T,
+    pub meaning: Cell<Option<Meaning>>,
 }
 
-impl SemanticToken {
-    pub fn new(value: Token, semantic: Option<Semantic>) -> Self {
+impl<T> Semantic<T> {
+    pub fn new(value: T, meaning: Option<Meaning>) -> Self {
         Self {
             value,
-            semantic: Cell::new(semantic),
+            meaning: Cell::new(meaning),
         }
     }
 
-    pub fn inner(&self) -> &Token {
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    pub fn get_ref(&self) -> &T {
         &self.value
     }
 
-    pub fn update_semantic(&mut self, semantic: Semantic) {
-        self.semantic = Cell::new(Some(semantic));
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    pub fn update_semantic_meaning(&self, meaning: Meaning) {
+        self.meaning.set(Some(meaning));
     }
 }
 
-impl std::fmt::Display for SemanticToken {
+impl<T> std::ops::Deref for Semantic<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Semantic<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+impl std::fmt::Display for Semantic<Token> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.semantic.get() {
+        match self.meaning.get() {
             Some(s) => write!(f, "{}&{}", self.value, s),
             None => write!(f, "{}&?", self.value),
         }
     }
 }
 
-impl std::fmt::Display for Spanned<SemanticToken> {
+impl std::fmt::Display for Spanned<Semantic<Token>> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -347,8 +368,8 @@ impl LexerChar for char {
 enum Action {
     Continue,
     Again,
-    YieldAndContinue((Token, Option<Semantic>)),
-    YieldAndAgain((Token, Option<Semantic>)),
+    YieldAndContinue((Token, Option<Meaning>)),
+    YieldAndAgain((Token, Option<Meaning>)),
 }
 
 struct Lexer<'s> {
@@ -415,7 +436,7 @@ impl<'s> Lexer<'s> {
             self.state = State::Start;
             Ok(Action::YieldAndAgain((
                 Token::NumericLiteral(self.integer_buf),
-                Some(Semantic::NumericLiteral),
+                Some(Meaning::NumericLiteral),
             )))
         } else {
             Err(Spanned::new(
@@ -484,31 +505,31 @@ impl<'s> Lexer<'s> {
                     }
                     ',' => Ok(Action::YieldAndContinue((
                         Token::Comma,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
                     '+' => Ok(Action::YieldAndContinue((
                         Token::Plus,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
                     '-' => Ok(Action::YieldAndContinue((
                         Token::Minus,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
                     '(' => Ok(Action::YieldAndContinue((
                         Token::LeftParenthesis,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
                     ')' => Ok(Action::YieldAndContinue((
                         Token::RightParenthesis,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
                     '[' => Ok(Action::YieldAndContinue((
                         Token::LeftBracket,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
                     ']' => Ok(Action::YieldAndContinue((
                         Token::RightBracket,
-                        Some(Semantic::Operator),
+                        Some(Meaning::Operator),
                     ))),
 
                     '/' => {
@@ -560,7 +581,7 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
                     Ok(Action::YieldAndContinue((
                         Token::Label('u'.into()),
-                        Some(Semantic::Label),
+                        Some(Meaning::Label),
                     )))
                 }
                 ident_other_char_pattern!() => {
@@ -583,7 +604,7 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
                     Ok(Action::YieldAndContinue((
                         Token::Label('b'.into()),
-                        Some(Semantic::Label),
+                        Some(Meaning::Label),
                     )))
                 }
                 ident_other_char_pattern!() => {
@@ -607,7 +628,7 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
                     return Ok(Action::YieldAndContinue((
                         self.pop_label(),
-                        Some(Semantic::Label),
+                        Some(Meaning::Label),
                     )));
                 }
 
@@ -626,7 +647,7 @@ impl<'s> Lexer<'s> {
                         self.state = State::Start;
                         return Ok(Action::YieldAndAgain((
                             Token::NumericLiteral(0),
-                            Some(Semantic::NumericLiteral),
+                            Some(Meaning::NumericLiteral),
                         )));
                     }
                 }
@@ -710,7 +731,7 @@ impl<'s> Lexer<'s> {
 
                     return Ok(Action::YieldAndContinue((
                         self.pop_numeric_literal(),
-                        Some(Semantic::NumericLiteral),
+                        Some(Meaning::NumericLiteral),
                     )));
                 }
 
@@ -731,7 +752,7 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
                     Ok(Action::YieldAndContinue((
                         self.pop_unicode_string_literal(),
-                        Some(Semantic::StringLiteral),
+                        Some(Meaning::StringLiteral),
                     )))
                 }
                 _ => {
@@ -748,7 +769,7 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
                     Ok(Action::YieldAndContinue((
                         self.pop_byte_string_literal(),
-                        Some(Semantic::StringLiteral),
+                        Some(Meaning::StringLiteral),
                     )))
                 }
                 _ => {
@@ -775,7 +796,7 @@ impl<'s> Lexer<'s> {
                     self.state = State::Start;
                     return Ok(Action::YieldAndAgain((
                         self.pop_comment(),
-                        Some(Semantic::Comment),
+                        Some(Meaning::Comment),
                     )));
                 }
 
@@ -806,13 +827,13 @@ impl<'s> Lexer<'s> {
                 self.state = State::Start;
                 Ok(Action::YieldAndAgain((
                     self.pop_directive(),
-                    Some(Semantic::Directive),
+                    Some(Meaning::Directive),
                 )))
             }
         }
     }
 
-    fn feed_eos(&mut self) -> Result<Option<(Token, Option<Semantic>)>, Spanned<Error>> {
+    fn feed_eos(&mut self) -> Result<Option<(Token, Option<Meaning>)>, Spanned<Error>> {
         match self.state {
             State::Start | State::Whitespace | State::Boundary => Ok(None),
             State::UPrefix => Ok(Some((Token::Name('u'.into()), None))),
@@ -820,17 +841,17 @@ impl<'s> Lexer<'s> {
             State::Name => Ok(Some((self.pop_name(), None))),
             State::Zero => Ok(Some((
                 Token::NumericLiteral(0),
-                Some(Semantic::NumericLiteral),
+                Some(Meaning::NumericLiteral),
             ))),
             State::DecimalInteger => Ok(Some((
                 self.pop_numeric_literal(),
-                Some(Semantic::NumericLiteral),
+                Some(Meaning::NumericLiteral),
             ))),
             State::BinaryInteger | State::OctalInteger | State::HexadecimalInteger => {
                 if self.num_digits != 0 {
                     Ok(Some((
                         self.pop_numeric_literal(),
-                        Some(Semantic::NumericLiteral),
+                        Some(Meaning::NumericLiteral),
                     )))
                 } else {
                     Err(Spanned::new(
@@ -839,8 +860,8 @@ impl<'s> Lexer<'s> {
                     ))
                 }
             }
-            State::Comment => Ok(Some((self.pop_comment(), Some(Semantic::Comment)))),
-            State::Directive => Ok(Some((self.pop_directive(), Some(Semantic::Directive)))),
+            State::Comment => Ok(Some((self.pop_comment(), Some(Meaning::Comment)))),
+            State::Directive => Ok(Some((self.pop_directive(), Some(Meaning::Directive)))),
             State::SingleQuote
             | State::Char
             | State::UnicodeStringLiteral
@@ -853,7 +874,7 @@ impl<'s> Lexer<'s> {
         }
     }
 
-    fn tokenize(&mut self) -> Result<Vec<Spanned<SemanticToken>>, Spanned<Error>> {
+    fn tokenize(&mut self) -> Result<Vec<Spanned<Semantic<Token>>>, Spanned<Error>> {
         let mut tokens = vec![];
         for c in self.source.chars() {
             loop {
@@ -868,14 +889,14 @@ impl<'s> Lexer<'s> {
                     Action::YieldAndContinue((token, semantic)) => {
                         self.offset += 1;
                         tokens.push(Spanned::new(
-                            SemanticToken::new(token, semantic),
+                            Semantic::new(token, semantic),
                             Span::new(self.start, self.offset - self.start),
                         ));
                         break;
                     }
                     Action::YieldAndAgain((token, semantic)) => {
                         tokens.push(Spanned::new(
-                            SemanticToken::new(token, semantic),
+                            Semantic::new(token, semantic),
                             Span::new(self.start, self.offset - self.start),
                         ));
                         continue;
@@ -886,7 +907,7 @@ impl<'s> Lexer<'s> {
 
         if let Some((token, semantic)) = self.feed_eos()? {
             tokens.push(Spanned::new(
-                SemanticToken::new(token, semantic),
+                Semantic::new(token, semantic),
                 Span::new(self.start, self.offset - self.start),
             ));
         };
@@ -895,6 +916,6 @@ impl<'s> Lexer<'s> {
     }
 }
 
-pub fn tokenize(source: &str) -> Result<Vec<Spanned<SemanticToken>>, Spanned<Error>> {
+pub fn tokenize(source: &str) -> Result<Vec<Spanned<Semantic<Token>>>, Spanned<Error>> {
     Lexer::new(source).tokenize()
 }

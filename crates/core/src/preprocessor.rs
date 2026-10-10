@@ -1,4 +1,4 @@
-use crate::lexer::{Semantic, SemanticToken, Token, dummy};
+use crate::lexer::{Meaning, Semantic, Token, dummy};
 use crate::{
     Span, Spanned, UnsignedStorageInteger, format_unexpected_token_error,
     get_source_len_from_tokens,
@@ -39,62 +39,69 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-enum Replaceable {
+/// Alias name (the name to be expanded) for the alias system
+type AliasName = String;
+
+/// Alias value (the expansion target) for the alias system
+enum AliasValue {
+    /// Alias name expands to another name
     Name(String),
+
+    /// Alias name expands to numeric literal
     NumericLiteral(UnsignedStorageInteger),
+
+    /// Alias name expands to string literal
     StringLiteral(String),
 }
 
 struct Preprocessor<'s> {
-    tokens: &'s [Spanned<SemanticToken>],
-    offset: usize,
+    tokens: &'s [Spanned<Semantic<Token>>],
     source_len: usize,
-    table: HashMap<String, Replaceable>,
-    output: Vec<Cow<'s, Spanned<SemanticToken>>>,
+
+    offset: usize,
+
+    /// ARR stands for "Alias Replacement Rules"
+    arr_rules: HashMap<AliasName, AliasValue>,
+
+    output: Vec<Cow<'s, Spanned<Semantic<Token>>>>,
 }
 
 impl<'s> Preprocessor<'s> {
-    fn new(tokens: &'s [Spanned<SemanticToken>]) -> Self {
+    fn new(tokens: &'s [Spanned<Semantic<Token>>]) -> Self {
         Self {
             tokens,
-            offset: 0,
             source_len: get_source_len_from_tokens(tokens),
-            table: HashMap::new(),
+            offset: 0,
+            arr_rules: HashMap::new(),
             output: vec![],
         }
     }
 
-    #[allow(dead_code)]
-    fn peek(&mut self) -> Option<Spanned<&'s Token>> {
-        self.tokens.get(self.offset).map(
-            |Spanned {
-                 value: SemanticToken { value: token, .. },
-                 span,
-             }| Spanned::new(token, span.clone()),
-        )
+    #[inline]
+    fn lookup_arr_rules(&self, name: &AliasName) -> Option<&AliasValue> {
+        self.arr_rules.get(name)
     }
 
-    /// Returns a reference to the next token within the token stream, or error
+    /// Returns a reference to the next token in the token stream, or error
     /// if the expected kinds are not found.
     ///
-    /// The parameter `targets` contains a list of expected token-semantic
+    /// The parameter `targets` contains a list of expected token-meaning
     /// pairs, where the `&'s Token` is used to represent the expected token
-    /// kind, and the `Semantic` is for annotating the consumed token with
-    /// semantic information.
-    fn consume_any(
+    /// kind, and the `Meaning` is for annotating the consumed token with
+    /// semantic meaning.
+    fn expect_any(
         &mut self,
-        targets: &[(&'static Token, Semantic)],
+        targets: &[(&'static Token, Meaning)],
     ) -> Result<Spanned<&'s Token>, Spanned<Error>> {
         if let Some(Spanned {
-            value:
-                SemanticToken {
-                    value: t,
-                    semantic: s,
-                },
+            value: Semantic {
+                value: t,
+                meaning: s,
+            },
             span,
         }) = self.tokens.get(self.offset)
         {
-            let span = span.to_owned();
+            let span = *span;
             if let Some(target) = targets
                 .iter()
                 .find(|target| std::mem::discriminant(t) == std::mem::discriminant((**target).0))
@@ -119,9 +126,9 @@ impl<'s> Preprocessor<'s> {
         }
     }
 
-    fn consume_statement_end(&mut self) -> Result<(), Spanned<Error>> {
+    fn expect_statement_end(&mut self) -> Result<(), Spanned<Error>> {
         if let Some(Spanned {
-            value: SemanticToken { value: token, .. },
+            value: Semantic { value: token, .. },
             span,
         }) = self.tokens.get(self.offset)
         {
@@ -133,7 +140,7 @@ impl<'s> Preprocessor<'s> {
                     Error::ExpectedStatementEnd {
                         unexpected: &token.to_dummy(),
                     },
-                    span.to_owned(),
+                    *span,
                 ))
             }
         } else {
@@ -143,83 +150,81 @@ impl<'s> Preprocessor<'s> {
 
     fn parse_directive_alias(&mut self) -> Result<(), Spanned<Error>> {
         let alias = self
-            .consume_any(&[(&dummy::NAME, Semantic::Alias)])?
+            .expect_any(&[(&dummy::NAME, Meaning::Alias)])?
             .map(|t| unsafe {
                 match t {
-                    Token::Name(name) => name.to_owned(),
+                    Token::Name(name) => name.clone(),
                     _ => std::hint::unreachable_unchecked(),
                 }
             });
 
         let value = self
-            .consume_any(&[
-                (&dummy::NAME, Semantic::Alias),
-                (&dummy::NUMERIC_LITERAL, Semantic::NumericLiteral),
-                (&dummy::UNICODE_STRING_LITERAL, Semantic::StringLiteral),
+            .expect_any(&[
+                (&dummy::NAME, Meaning::Alias),
+                (&dummy::NUMERIC_LITERAL, Meaning::NumericLiteral),
+                (&dummy::UNICODE_STRING_LITERAL, Meaning::StringLiteral),
             ])?
             .map(|t| unsafe {
                 match t {
-                    Token::Name(s) => Replaceable::Name(s.to_owned()),
-                    Token::NumericLiteral(i) => Replaceable::NumericLiteral(i.to_owned()),
-                    Token::UnicodeStringLiteral(s) => Replaceable::StringLiteral(s.to_owned()),
+                    Token::Name(s) => AliasValue::Name(s.clone()),
+                    Token::NumericLiteral(i) => AliasValue::NumericLiteral(*i),
+                    Token::UnicodeStringLiteral(s) => AliasValue::StringLiteral(s.clone()),
                     _ => std::hint::unreachable_unchecked(),
                 }
             });
 
-        self.consume_statement_end()?;
+        self.expect_statement_end()?;
 
-        self.table.insert(alias.into_inner(), value.into_inner());
+        self.arr_rules
+            .insert(alias.into_inner(), value.into_inner());
 
         Ok(())
     }
 
-    fn parse_directive(&mut self, name: &str, span: &Span) -> Result<(), Spanned<Error>> {
+    fn parse_directive(&mut self, name: &str, span: Span) -> Result<(), Spanned<Error>> {
         match name {
             "alias" => self.parse_directive_alias(),
             _ => Err(Spanned::new(
                 Error::UnknownDirective {
                     name: name.to_owned(),
                 },
-                span.to_owned(),
+                span,
             )),
         }
     }
 
     fn lookup_and_might_replace(
         &mut self,
-        name: &str,
-        token: &'s Spanned<SemanticToken>,
+        name: &AliasName,
+        token: &'s Spanned<Semantic<Token>>,
     ) -> Result<(), Spanned<Error>> {
-        let token = if let Some(replaceable) = self.table.get(name) {
-            token.inner().semantic.set(Some(Semantic::Alias));
-
-            let span = token.span.to_owned();
-            let token = match replaceable {
-                Replaceable::Name(s) => SemanticToken::new(Token::Name(s.to_owned()), None),
-                Replaceable::NumericLiteral(i) => {
-                    SemanticToken::new(Token::NumericLiteral(i.to_owned()), None)
-                }
-                Replaceable::StringLiteral(s) => {
-                    SemanticToken::new(Token::UnicodeStringLiteral(s.to_owned()), None)
-                }
-            };
-
-            Cow::Owned(Spanned::new(token, span))
+        let t = if let Some(value) = self.lookup_arr_rules(name) {
+            token.update_semantic_meaning(Meaning::Alias);
+            Cow::Owned(Spanned::new(
+                match value {
+                    AliasValue::Name(s) => Semantic::new(Token::Name(s.clone()), None),
+                    AliasValue::NumericLiteral(i) => Semantic::new(Token::NumericLiteral(*i), None),
+                    AliasValue::StringLiteral(s) => {
+                        Semantic::new(Token::UnicodeStringLiteral(s.clone()), None)
+                    }
+                },
+                token.span(),
+            ))
         } else {
             Cow::Borrowed(token)
         };
 
-        self.output.push(token);
+        self.output.push(t);
 
         Ok(())
     }
 
-    fn preprocess(&mut self) -> Result<Vec<Cow<'s, Spanned<SemanticToken>>>, Spanned<Error>> {
+    fn preprocess(&mut self) -> Result<Vec<Cow<'s, Spanned<Semantic<Token>>>>, Spanned<Error>> {
         loop {
             if let Some(token) = self.tokens.get(self.offset) {
                 self.offset += 1;
-                match token.inner().inner() {
-                    Token::Directive(name) => self.parse_directive(name, &token.span)?,
+                match token.get_ref().get_ref() {
+                    Token::Directive(name) => self.parse_directive(name, token.span())?,
                     Token::Name(name) => self.lookup_and_might_replace(name, token)?,
                     Token::Comment(_) => (),
                     _ => self.output.push(Cow::Borrowed(token)),
@@ -232,7 +237,7 @@ impl<'s> Preprocessor<'s> {
 }
 
 pub fn preprocess(
-    tokens: &[Spanned<SemanticToken>],
-) -> Result<Vec<Cow<'_, Spanned<SemanticToken>>>, Spanned<Error>> {
+    tokens: &[Spanned<Semantic<Token>>],
+) -> Result<Vec<Cow<'_, Spanned<Semantic<Token>>>>, Spanned<Error>> {
     Preprocessor::new(tokens).preprocess()
 }

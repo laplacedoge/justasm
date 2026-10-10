@@ -1,10 +1,11 @@
-use crate::lexer::{Semantic, SemanticToken, Token, dummy};
+use crate::lexer::{Meaning, Semantic, Token, dummy};
 use crate::{
     SignedStorageInteger, Span, Spanned, UnsignedStorageInteger, format_unexpected_token_error,
 };
 use bilge::prelude::*;
 use num_traits::AsPrimitive;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::ops::{Neg, RangeInclusive};
 
 #[derive(Debug)]
@@ -34,19 +35,6 @@ pub enum Error {
     ExpectedStatementEnd {
         unexpected: &'static Token,
     },
-}
-
-impl Error {
-    fn unexpected_token(unexpected: &'static Token, expected: Vec<&'static Token>) -> Self {
-        Error::UnexpectedToken {
-            unexpected,
-            expected,
-        }
-    }
-
-    fn integer_literal_out_of_range(range: RangeInclusive<i64>, value: i64) -> Self {
-        Error::IntegerLiteralOutOfRange { range, value }
-    }
 }
 
 impl std::fmt::Display for Error {
@@ -653,8 +641,8 @@ pub mod data_definition {
                     }
                     Item::UnicodeSequence(s) => {
                         for c in s.chars() {
-                            let integer = F::try_from_char(c)
-                                .map_err(|e| Spanned::new(e, span.to_owned()))?;
+                            let integer =
+                                F::try_from_char(c).map_err(|e| Spanned::new(e, span.clone()))?;
                             integers.push(integer);
                         }
                     }
@@ -709,9 +697,9 @@ pub struct GlobalBlock {
 }
 
 pub struct Parser<'t> {
-    tokens: &'t [Cow<'t, Spanned<SemanticToken>>],
-    offset: usize,
+    tokens: &'t [Cow<'t, Spanned<Semantic<Token>>>],
     source_len: usize,
+    offset: Cell<usize>,
 }
 
 trait SourceStr {
@@ -735,7 +723,7 @@ impl SourceStr for str {
 }
 
 impl<'t> Parser<'t> {
-    fn new(tokens: &'t [Cow<'t, Spanned<SemanticToken>>]) -> Self {
+    fn new(tokens: &'t [Cow<'t, Spanned<Semantic<Token>>>]) -> Self {
         let num_tokens = tokens.len();
         let source_len = if num_tokens == 0 {
             0
@@ -746,59 +734,31 @@ impl<'t> Parser<'t> {
 
         Self {
             tokens,
-            offset: 0,
             source_len,
+            offset: Cell::new(0),
         }
     }
 
-    fn expect_this(
-        &mut self,
-        token: &'static Token,
-        semantic: Option<Semantic>,
-    ) -> Option<Spanned<&'t Token>> {
-        if let Some(Spanned {
-            value:
-                SemanticToken {
-                    value: t,
-                    semantic: s,
-                },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if std::mem::discriminant(t) == std::mem::discriminant(token) {
-                if let Some(semantic) = semantic {
-                    s.set(Some(semantic))
-                }
-                self.offset += 1;
-                return Some(Spanned::new(t, span.to_owned()));
-            }
-        }
-
-        None
+    fn peek(&self) -> Option<&'t Spanned<Semantic<Token>>> {
+        self.tokens.get(self.offset.get()).map(|c| c.as_ref())
     }
 
-    fn consume_any(
+    fn bump(&self) {
+        self.offset.set(self.offset.get() + 1)
+    }
+
+    fn require_any(
         &mut self,
-        targets: &[(&'static Token, Option<Semantic>)],
+        targets: &[(&'static Token, Option<Meaning>)],
     ) -> Result<Spanned<&'t Token>, Spanned<Error>> {
-        if let Some(Spanned {
-            value:
-                SemanticToken {
-                    value: t,
-                    semantic: s,
-                },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            let span = span.to_owned();
-            if let Some(target) = targets
-                .iter()
-                .find(|target| std::mem::discriminant(t) == std::mem::discriminant((**target).0))
-            {
-                if let Some(semantic) = (*target).1 {
-                    s.set(Some(semantic))
+        if let Some(Spanned { value: t, span }) = self.peek() {
+            let span = *span;
+            if let Some(target) = targets.iter().find(|target| {
+                std::mem::discriminant(t.get_ref()) == std::mem::discriminant((**target).0)
+            }) {
+                if let Some(meaning) = (*target).1 {
+                    t.update_semantic_meaning(meaning);
                 }
-                self.offset += 1;
                 Ok(Spanned::new(t, span))
             } else {
                 Err(Spanned::new(
@@ -817,131 +777,153 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn consume_this(
+    fn require_this(
         &mut self,
         token: &'static Token,
-        semantic: Option<Semantic>,
+        meaning: Option<Meaning>,
     ) -> Result<Spanned<&'t Token>, Spanned<Error>> {
-        self.consume_any(&[(token, semantic)])
+        self.require_any(&[(token, meaning)])
     }
 
-    fn consume_numeric_literal(
+    #[allow(dead_code)]
+    fn match_any(
+        &mut self,
+        targets: &[(&'static Token, Option<Meaning>)],
+    ) -> Option<Spanned<&'t Token>> {
+        self.require_any(targets).inspect(|_| self.bump()).ok()
+    }
+
+    fn match_this(
+        &mut self,
+        token: &'static Token,
+        meaning: Option<Meaning>,
+    ) -> Option<Spanned<&'t Token>> {
+        self.require_this(token, meaning)
+            .inspect(|_| self.bump())
+            .ok()
+    }
+
+    fn expect_any(
+        &mut self,
+        targets: &[(&'static Token, Option<Meaning>)],
+    ) -> Result<Spanned<&'t Token>, Spanned<Error>> {
+        self.require_any(targets).inspect(|_| self.bump())
+    }
+
+    fn expect_this(
+        &mut self,
+        token: &'static Token,
+        meaning: Option<Meaning>,
+    ) -> Result<Spanned<&'t Token>, Spanned<Error>> {
+        self.require_this(token, meaning).inspect(|_| self.bump())
+    }
+
+    fn expect_numeric_literal(
         &mut self,
     ) -> Result<Spanned<UnsignedStorageInteger>, Spanned<Error>> {
-        self.consume_this(&dummy::NUMERIC_LITERAL, None).map(|s| {
+        self.expect_this(&dummy::NUMERIC_LITERAL, None).map(|s| {
             s.map(|t| match t {
-                Token::NumericLiteral(i) => i.to_owned(),
+                Token::NumericLiteral(i) => *i,
                 _ => unsafe { std::hint::unreachable_unchecked() },
             })
         })
     }
 
-    fn consume_data_definition_item(
+    fn expect_data_definition_item(
         &mut self,
     ) -> Result<Spanned<data_definition::Item>, Spanned<Error>> {
-        self.consume_any(&[
+        self.expect_any(&[
             (&dummy::NUMERIC_LITERAL, None),
             (&dummy::UNICODE_STRING_LITERAL, None),
             (&dummy::BYTE_STRING_LITERAL, None),
         ])
         .map(|s| {
             s.map(|t| match t {
-                Token::NumericLiteral(i) => data_definition::Item::Number(i.to_owned() as u32),
-                Token::UnicodeStringLiteral(s) => {
-                    data_definition::Item::UnicodeSequence(s.to_owned())
-                }
-                Token::ByteStringLiteral(s) => data_definition::Item::ByteSequence(s.to_owned()),
+                Token::NumericLiteral(i) => data_definition::Item::Number(*i as u32),
+                Token::UnicodeStringLiteral(s) => data_definition::Item::UnicodeSequence(s.clone()),
+                Token::ByteStringLiteral(s) => data_definition::Item::ByteSequence(s.clone()),
                 _ => unsafe { std::hint::unreachable_unchecked() },
             })
         })
     }
 
     #[allow(dead_code)]
-    fn consume_name(
-        &mut self,
-        semantic: Option<Semantic>,
-    ) -> Result<Spanned<String>, Spanned<Error>> {
-        Ok(self.consume_this(&dummy::NAME, semantic)?.map(|t| unsafe {
-            match t {
-                Token::Name(name) => name.to_owned(),
-                _ => std::hint::unreachable_unchecked(),
-            }
+    fn expect_name(&mut self, meaning: Option<Meaning>) -> Result<Spanned<String>, Spanned<Error>> {
+        Ok(self.expect_this(&dummy::NAME, meaning)?.map(|t| match t {
+            Token::Name(name) => name.clone(),
+            _ => unsafe { std::hint::unreachable_unchecked() },
         }))
     }
 
-    fn consume_label(&mut self) -> Result<Spanned<String>, Spanned<Error>> {
+    fn expect_label(&mut self) -> Result<Spanned<String>, Spanned<Error>> {
         Ok(self
-            .consume_this(&dummy::NAME, Some(Semantic::Label))?
-            .map(|t| unsafe {
-                match t {
-                    Token::Name(name) => name.to_owned(),
-                    _ => std::hint::unreachable_unchecked(),
-                }
+            .expect_this(&dummy::NAME, Some(Meaning::Label))?
+            .map(|t| match t {
+                Token::Name(name) => name.clone(),
+                _ => unsafe { std::hint::unreachable_unchecked() },
             }))
     }
 
-    fn expect_mnemonic(&mut self) -> Option<(Spanned<String>, &SemanticToken)> {
-        if let Some(Spanned { value: token, span }) =
-            self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
+    fn match_mnemonic(&mut self) -> Option<(Spanned<String>, &Semantic<Token>)> {
+        if let Some(Spanned { value: token, span }) = self.peek() {
             if let Token::Name(ref name) = token.value {
-                self.offset += 1;
-                return Some((Spanned::new(name.clone(), span.to_owned()), token));
+                self.bump();
+                return Some((Spanned::new(name.clone(), span.clone()), token));
             }
         }
 
         None
     }
 
-    fn expect_global_label(&mut self) -> Option<Spanned<String>> {
-        if let Some(Spanned {
-            value: SemanticToken { value: token, .. },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if let Token::Label(label) = token {
-                if !label.starts_with('.') {
-                    self.offset += 1;
-                    return Some(Spanned::new(label.to_owned(), span.to_owned()));
+    fn match_global_label(&mut self) -> Option<Spanned<String>> {
+        match self.require_this(&dummy::LABEL, None) {
+            Ok(Spanned { value: token, span }) => match token {
+                Token::Label(s) => {
+                    if !s.starts_with('.') {
+                        self.bump();
+                        Some(Spanned::new(s.clone(), span))
+                    } else {
+                        None
+                    }
                 }
-            }
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            },
+            Err(_) => None,
         }
-
-        None
     }
 
-    fn expect_local_label(&mut self) -> Option<Spanned<String>> {
-        if let Some(Spanned {
-            value: SemanticToken { value: token, .. },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if let Token::Label(label) = token {
-                if label.starts_with('.') {
-                    self.offset += 1;
-                    return Some(Spanned::new(label.to_owned(), span.to_owned()));
+    fn match_local_label(&mut self) -> Option<Spanned<String>> {
+        match self.require_this(&dummy::LABEL, None) {
+            Ok(Spanned { value: token, span }) => match token {
+                Token::Label(s) => {
+                    if s.starts_with('.') {
+                        self.bump();
+                        Some(Spanned::new(s.clone(), span))
+                    } else {
+                        None
+                    }
                 }
-            }
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            },
+            Err(_) => None,
         }
-
-        None
     }
 
-    fn consume_statement_end(&mut self) -> Result<(), Spanned<Error>> {
+    fn expect_statement_end(&mut self) -> Result<(), Spanned<Error>> {
         if let Some(Spanned {
-            value: SemanticToken { value: token, .. },
+            value: Semantic { value: token, .. },
             span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
+        }) = self.peek()
         {
             if let Token::Boundary = token {
-                self.offset += 1;
+                self.bump();
                 Ok(())
             } else {
                 Err(Spanned::new(
                     Error::ExpectedStatementEnd {
                         unexpected: &token.to_dummy(),
                     },
-                    span.to_owned(),
+                    *span,
                 ))
             }
         } else {
@@ -952,12 +934,12 @@ impl<'t> Parser<'t> {
     fn skip_boundaries(&mut self) {
         loop {
             if let Some(Spanned {
-                value: SemanticToken { value: token, .. },
+                value: Semantic { value: token, .. },
                 ..
-            }) = self.tokens.get(self.offset).map(|c| c.as_ref())
+            }) = self.peek()
             {
                 if let Token::Boundary = token {
-                    self.offset += 1;
+                    self.bump();
                     continue;
                 }
             }
@@ -966,54 +948,36 @@ impl<'t> Parser<'t> {
         }
     }
 
-    fn consume_gp_register(&mut self) -> Result<Spanned<u3>, Spanned<Error>> {
-        if let Some(Spanned {
-            value:
-                SemanticToken {
-                    value: token,
-                    semantic,
-                },
-            span,
-        }) = self.tokens.get(self.offset).map(|c| c.as_ref())
-        {
-            if let Token::Name(name) = token {
-                let register = name.parse_gp_register().map_err(|s| {
-                    Spanned::new(Error::UnknownGpRegister { name: s }, span.to_owned())
-                })?;
+    fn expect_gp_register(&mut self) -> Result<Spanned<u3>, Spanned<Error>> {
+        self.require_this(&dummy::NAME, Some(Meaning::Register))
+            .and_then(|Spanned { value: token, span }| match token {
+                Token::Name(s) => {
+                    let register = s
+                        .parse_gp_register()
+                        .map_err(|s| Spanned::new(Error::UnknownGpRegister { name: s }, span))?;
 
-                semantic.set(Some(Semantic::Register));
-                self.offset += 1;
+                    self.bump();
 
-                return Ok(Spanned::new(register, span.to_owned()));
-            }
-
-            return Err(Spanned::new(
-                Error::unexpected_token(&dummy::NAME, vec![token.to_dummy()]),
-                span.clone(),
-            ));
-        }
-
-        Err(Spanned::new(
-            Error::UnexpectedEos,
-            Span::new(self.source_len, 0),
-        ))
+                    Ok(Spanned::new(register, span))
+                }
+                _ => unsafe { std::hint::unreachable_unchecked() },
+            })
     }
 
     fn parse_format_a(&mut self, opc: u4, fun: u3) -> Result<Spanned<FormatA>, Spanned<Error>> {
-        let rd = self.consume_gp_register()?;
+        let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-        self.consume_this(&dummy::COMMA, None)?;
+        self.expect_this(&dummy::COMMA, None)?;
 
-        let rs1 = self.consume_gp_register()?;
+        let (rs1, _) = self.expect_gp_register()?.into_parts();
 
-        self.consume_this(&dummy::COMMA, None)?;
+        self.expect_this(&dummy::COMMA, None)?;
 
-        let rs2 = self.consume_gp_register()?;
+        let (rs2, end_span) = self.expect_gp_register()?.into_parts();
 
-        let span = rd.merge_span(&rs2);
         Ok(Spanned::new(
-            FormatA::new(opc, fun, rs1.value, rs2.value, rd.value),
-            span,
+            FormatA::new(opc, fun, rs1, rs2, rd),
+            start_span.merge_with(end_span),
         ))
     }
 
@@ -1028,11 +992,14 @@ impl<'t> Parser<'t> {
         let Spanned {
             value: magnitude,
             span,
-        } = self.consume_numeric_literal()?;
+        } = self.expect_numeric_literal()?;
         let value = magnitude.cast_checked().map_err(|e| {
             Spanned::new(
-                Error::integer_literal_out_of_range(e.range, e.value),
-                span.clone(),
+                Error::IntegerLiteralOutOfRange {
+                    range: e.range,
+                    value: e.value,
+                },
+                span,
             )
         })?;
         Ok(Spanned::new(value, span))
@@ -1048,12 +1015,12 @@ impl<'t> Parser<'t> {
     {
         let negative;
         let sign_span;
-        if let Some(t) = self.expect_this(&dummy::PLUS, None) {
+        if let Some(t) = self.match_this(&dummy::PLUS, None) {
             negative = false;
-            sign_span = Some(t.span.to_owned());
-        } else if let Some(t) = self.expect_this(&dummy::MINUS, None) {
+            sign_span = Some(t.span());
+        } else if let Some(t) = self.match_this(&dummy::MINUS, None) {
             negative = true;
-            sign_span = Some(t.span.to_owned());
+            sign_span = Some(t.span());
         } else {
             negative = false;
             sign_span = None;
@@ -1062,9 +1029,9 @@ impl<'t> Parser<'t> {
         let Spanned {
             value: magnitude,
             span: value_span,
-        } = self.consume_numeric_literal()?;
-        let new_span = match sign_span {
-            Some(s) => s.merge(&value_span),
+        } = self.expect_numeric_literal()?;
+        let span = match sign_span {
+            Some(s) => s.merge_with(value_span),
             None => value_span,
         };
         let signed_value = if negative {
@@ -1074,59 +1041,57 @@ impl<'t> Parser<'t> {
         };
         let value = signed_value.cast_checked().map_err(|e| {
             Spanned::new(
-                Error::integer_literal_out_of_range(e.range, e.value),
-                new_span.clone(),
+                Error::IntegerLiteralOutOfRange {
+                    range: e.range,
+                    value: e.value,
+                },
+                span,
             )
         })?;
-        Ok(Spanned::new(value, new_span))
+        Ok(Spanned::new(value, span))
     }
 
     fn parse_format_d_lli_lui(&mut self, opc: u4) -> Result<Spanned<FormatD>, Spanned<Error>> {
-        let rd = self.consume_gp_register()?;
+        let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-        self.consume_this(&dummy::COMMA, None)?;
+        self.expect_this(&dummy::COMMA, None)?;
 
-        let imm = self.parse_integer()?;
+        let (imm, end_span) = self.parse_integer()?.into_parts();
 
-        let span = rd.merge_span(&imm);
-        Ok(Spanned::new(FormatD::new(opc, imm.value, rd.value), span))
+        Ok(Spanned::new(
+            FormatD::new(opc, imm, rd),
+            start_span.merge_with(end_span),
+        ))
     }
 
     fn parse_format_d_adi(&mut self, opc: u4) -> Result<Spanned<FormatD>, Spanned<Error>> {
-        let rd = self.consume_gp_register()?;
+        let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-        self.consume_this(&dummy::COMMA, None)?;
+        self.expect_this(&dummy::COMMA, None)?;
 
-        let imm: Spanned<i9> = self.parse_possibly_signed_integer()?;
+        let (imm, end_span) = self.parse_possibly_signed_integer::<i16, 9>()?.into_parts();
 
-        let span = rd.merge_span(&imm);
         Ok(Spanned::new(
-            FormatD::new(opc, u9::from_u16(imm.value.to_bits()), rd.value),
-            span,
+            FormatD::new(opc, u9::from_u16(imm.to_bits()), rd),
+            start_span.merge_with(end_span),
         ))
     }
 
     fn parse_format_e_ld(&mut self, opc: u4, fun: u1) -> Result<Spanned<FormatE>, Spanned<Error>> {
-        let Spanned {
-            value: rd,
-            span: start_span,
-        } = self.consume_gp_register()?;
+        let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-        self.consume_this(&dummy::COMMA, None)?;
+        self.expect_this(&dummy::COMMA, None)?;
 
-        self.consume_this(&dummy::LEFT_BRACKET, None)?;
+        self.expect_this(&dummy::LEFT_BRACKET, None)?;
 
-        let rs = self.consume_gp_register()?.value;
+        let rs = self.expect_gp_register()?.value;
 
-        let (off, end_span) = match self.expect_this(&dummy::RIGHT_BRACKET, None) {
-            Some(t) => (i5::new(0), t.span.to_owned()),
+        let (off, end_span) = match self.match_this(&dummy::RIGHT_BRACKET, None) {
+            Some(t) => (i5::new(0), t.span()),
             None => {
-                let off = self.parse_possibly_signed_integer()?.value;
+                let (off, _) = self.parse_possibly_signed_integer::<i8, 5>()?.into_parts();
 
-                let span = self
-                    .consume_this(&dummy::RIGHT_BRACKET, None)?
-                    .span
-                    .to_owned();
+                let (_, span) = self.expect_this(&dummy::RIGHT_BRACKET, None)?.into_parts();
 
                 (off, span)
             }
@@ -1134,39 +1099,33 @@ impl<'t> Parser<'t> {
 
         Ok(Spanned::new(
             FormatE::new(opc, fun, off, rs, rd),
-            start_span.merge(&end_span),
+            start_span.merge_with(end_span),
         ))
     }
 
     fn parse_format_e_st(&mut self, opc: u4, fun: u1) -> Result<Spanned<FormatE>, Spanned<Error>> {
-        let start_span = self
-            .consume_this(&dummy::LEFT_BRACKET, None)?
-            .span
-            .to_owned();
+        let (_, start_span) = self.expect_this(&dummy::LEFT_BRACKET, None)?.into_parts();
 
-        let rd = self.consume_gp_register()?.value;
+        let (rd, _) = self.expect_gp_register()?.into_parts();
 
-        let off = match self.expect_this(&dummy::RIGHT_BRACKET, None) {
+        let off = match self.match_this(&dummy::RIGHT_BRACKET, None) {
             Some(_) => i5::new(0),
             None => {
-                let off = self.parse_possibly_signed_integer()?.into_inner();
+                let (off, _) = self.parse_possibly_signed_integer::<i8, 5>()?.into_parts();
 
-                self.consume_this(&dummy::RIGHT_BRACKET, None)?;
+                self.expect_this(&dummy::RIGHT_BRACKET, None)?;
 
                 off
             }
         };
 
-        self.consume_this(&dummy::COMMA, None)?;
+        self.expect_this(&dummy::COMMA, None)?;
 
-        let Spanned {
-            value: rs,
-            span: end_span,
-        } = self.consume_gp_register()?;
+        let (rs, end_span) = self.expect_gp_register()?.into_parts();
 
         Ok(Spanned::new(
             FormatE::new(opc, fun, off, rs, rd),
-            start_span.merge(&end_span),
+            start_span.merge_with(end_span),
         ))
     }
 
@@ -1176,14 +1135,14 @@ impl<'t> Parser<'t> {
         let mut list = vec![];
         let mut span;
 
-        let value = self.consume_data_definition_item()?;
-        span = value.span.clone();
+        let value = self.expect_data_definition_item()?;
+        span = value.span();
         list.push(value);
 
         loop {
-            if self.expect_this(&dummy::COMMA, None).is_some() {
-                let value = self.consume_data_definition_item()?;
-                span = span.merge(&value.span);
+            if self.match_this(&dummy::COMMA, None).is_some() {
+                let value = self.expect_data_definition_item()?;
+                span.merge(value.span());
                 list.push(value);
                 continue;
             } else {
@@ -1202,10 +1161,10 @@ impl<'t> Parser<'t> {
                 span: mnemonic_span,
                 value: name,
             },
-            SemanticToken { semantic, .. },
-        )) = self.expect_mnemonic()
+            Semantic { meaning, .. },
+        )) = self.match_mnemonic()
         {
-            semantic.set(Some(Semantic::Instruction));
+            meaning.set(Some(Meaning::Instruction));
             let (statement, operand_span) = match name.as_ref() {
                 "add" => {
                     let Spanned { value, span } = self.parse_format_a(OPC_BIN, BIN_FN_ADD)?;
@@ -1248,70 +1207,70 @@ impl<'t> Parser<'t> {
                 }
 
                 "beq" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Beq(label)),
                         span,
                     )
                 }
                 "bne" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Bne(label)),
                         span,
                     )
                 }
                 "bhi" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Bhi(label)),
                         span,
                     )
                 }
                 "bgt" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Bgt(label)),
                         span,
                     )
                 }
                 "bhs" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Bhs(label)),
                         span,
                     )
                 }
                 "bge" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Bge(label)),
                         span,
                     )
                 }
                 "blo" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Blo(label)),
                         span,
                     )
                 }
                 "blt" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Blt(label)),
                         span,
                     )
                 }
                 "bls" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Bls(label)),
                         span,
                     )
                 }
                 "ble" => {
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Ble(label)),
                         span,
@@ -1350,82 +1309,76 @@ impl<'t> Parser<'t> {
 
                 // Pseudo instructions
                 "nop" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
                     (
                         Statement::BinaryInstruction(BinaryForm::add(GP_REG_0, GP_REG_0, GP_REG_0)),
-                        mnemonic_span.clone(),
+                        mnemonic_span,
                     )
                 }
                 "mov" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    let rd = self.consume_gp_register()?;
+                    let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-                    self.consume_this(&dummy::COMMA, None)?;
+                    self.expect_this(&dummy::COMMA, None)?;
 
-                    let rs = self.consume_gp_register()?;
+                    let (rs, end_span) = self.expect_gp_register()?.into_parts();
 
-                    let new_span = rd.merge_span(&rs);
                     (
-                        Statement::BinaryInstruction(BinaryForm::add(rd.value, rs.value, GP_REG_0)),
-                        new_span,
+                        Statement::BinaryInstruction(BinaryForm::add(rd, rs, GP_REG_0)),
+                        start_span.merge_with(end_span),
                     )
                 }
                 "cmp" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    let ra = self.consume_gp_register()?;
+                    let (ra, start_span) = self.expect_gp_register()?.into_parts();
 
-                    self.consume_this(&dummy::COMMA, None)?;
+                    self.expect_this(&dummy::COMMA, None)?;
 
-                    let rb = self.consume_gp_register()?;
+                    let (rb, end_span) = self.expect_gp_register()?.into_parts();
 
-                    let span = ra.merge_span(&rb);
                     (
-                        Statement::BinaryInstruction(BinaryForm::sub(GP_REG_0, ra.value, rb.value)),
-                        span,
+                        Statement::BinaryInstruction(BinaryForm::sub(GP_REG_0, ra, rb)),
+                        start_span.merge_with(end_span),
                     )
                 }
                 "lea" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    let rd = self.consume_gp_register()?;
+                    let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-                    self.consume_this(&dummy::COMMA, None)?;
+                    self.expect_this(&dummy::COMMA, None)?;
 
-                    let label = self.consume_label()?;
+                    let (label, end_span) = self.expect_label()?.into_parts();
 
-                    let span = rd.merge_span(&label);
                     (
-                        Statement::SymbolicInstruction(SymbolicForm::Lea {
-                            rd: rd.value,
-                            label: label.value,
-                        }),
-                        span,
+                        Statement::SymbolicInstruction(SymbolicForm::Lea { rd, label }),
+                        start_span.merge_with(end_span),
                     )
                 }
                 "lwi" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    let rd = self.consume_gp_register()?;
+                    let (rd, start_span) = self.expect_gp_register()?.into_parts();
 
-                    self.consume_this(&dummy::COMMA, None)?;
+                    self.expect_this(&dummy::COMMA, None)?;
 
-                    let imm = self.parse_integer::<u16, 16>()?;
+                    let (imm, end_span) = self.parse_integer::<u16, 16>()?.into_parts();
 
                     (
                         Statement::PseudoInstruction(PseudoForm::Lwi {
-                            rd: rd.value,
-                            imm: imm.value.as_u16(),
+                            rd,
+                            imm: imm.as_u16(),
                         }),
-                        rd.merge_span(&imm),
+                        start_span.merge_with(end_span),
                     )
                 }
                 "jmp" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
 
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Jmp(label)),
@@ -1433,9 +1386,9 @@ impl<'t> Parser<'t> {
                     )
                 }
                 "cal" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    let Spanned { value: label, span } = self.consume_label()?;
+                    let Spanned { value: label, span } = self.expect_label()?;
 
                     (
                         Statement::SymbolicInstruction(SymbolicForm::Cal(label)),
@@ -1443,12 +1396,9 @@ impl<'t> Parser<'t> {
                     )
                 }
                 "ret" => {
-                    semantic.set(Some(Semantic::PseudoInstruction));
+                    meaning.set(Some(Meaning::PseudoInstruction));
 
-                    (
-                        Statement::PseudoInstruction(PseudoForm::Ret),
-                        mnemonic_span.clone(),
-                    )
+                    (Statement::PseudoInstruction(PseudoForm::Ret), mnemonic_span)
                 }
 
                 ".byte" => {
@@ -1490,11 +1440,11 @@ impl<'t> Parser<'t> {
                 }
             };
 
-            self.consume_statement_end()?;
+            self.expect_statement_end()?;
 
             return Ok(Some(Spanned::new(
                 statement,
-                mnemonic_span.merge(&operand_span),
+                mnemonic_span.merge_with(operand_span),
             )));
         }
 
@@ -1504,7 +1454,7 @@ impl<'t> Parser<'t> {
     fn parse_local_block(&mut self) -> Result<Option<LocalBlock>, Spanned<Error>> {
         self.skip_boundaries();
 
-        if let Some(label) = self.expect_local_label() {
+        if let Some(label) = self.match_local_label() {
             let mut statements = vec![];
             loop {
                 if let Some(statement) = self.parse_statement()? {
@@ -1523,7 +1473,7 @@ impl<'t> Parser<'t> {
     fn parse_global_block(&mut self) -> Result<Option<GlobalBlock>, Spanned<Error>> {
         self.skip_boundaries();
 
-        if let Some(label) = self.expect_global_label() {
+        if let Some(label) = self.match_global_label() {
             let mut statements = vec![];
             loop {
                 if let Some(statement) = self.parse_statement()? {
@@ -1566,6 +1516,6 @@ impl<'t> Parser<'t> {
     }
 }
 
-pub fn parse(tokens: &[Cow<Spanned<SemanticToken>>]) -> Result<Vec<GlobalBlock>, Spanned<Error>> {
+pub fn parse(tokens: &[Cow<Spanned<Semantic<Token>>>]) -> Result<Vec<GlobalBlock>, Spanned<Error>> {
     Parser::new(tokens).parse()
 }

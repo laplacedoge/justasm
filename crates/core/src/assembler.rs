@@ -71,7 +71,7 @@ fn lookup_label(
             label: label.to_owned(),
         })
     }
-    .map(|offset| offset.to_owned())
+    .map(|offset| *offset)
 }
 
 fn expand_word_immediate_load(
@@ -114,7 +114,7 @@ impl DynamicForm {
         let expanded_forms = smallvec![BinaryForm::jpp(i11::new(0))];
         let expanded_count = expanded_forms.len() as u8;
         DynamicForm {
-            symbolic_form: symbolic_form.to_owned(),
+            symbolic_form: symbolic_form.clone(),
             expanded_forms,
             expanded_count,
         }
@@ -136,11 +136,11 @@ impl DynamicForm {
                 let address = MEM_ADDR_ROM_START + (word_offset * 2);
 
                 expand_word_immediate_load(
-                    rd.to_owned(),
+                    *rd,
                     address
                         .try_into()
                         .map_err(|_| Error::AbsoluteBranchOutOfRange {
-                            label: label.to_owned(),
+                            label: label.clone(),
                             address: word_offset,
                         })?,
                     Some(self.expanded_count as usize),
@@ -158,7 +158,7 @@ impl DynamicForm {
                         address
                             .try_into()
                             .map_err(|_| Error::AbsoluteBranchOutOfRange {
-                                label: label.to_owned(),
+                                label: label.clone(),
                                 address: word_offset,
                             })?,
                         Some(self.expanded_count as usize - 1),
@@ -181,7 +181,7 @@ impl DynamicForm {
                         address
                             .try_into()
                             .map_err(|_| Error::AbsoluteBranchOutOfRange {
-                                label: label.to_owned(),
+                                label: label.clone(),
                                 address: word_offset,
                             })?,
                         Some(self.expanded_count as usize - 1),
@@ -268,7 +268,7 @@ impl parser::Statement {
     fn expand(&self) -> SmallVec<[Statement; 3]> {
         match self {
             parser::Statement::BinaryInstruction(f) => {
-                smallvec![Statement::BinaryInstruction(f.to_owned())]
+                smallvec![Statement::BinaryInstruction(*f)]
             }
             parser::Statement::SymbolicInstruction(f) => {
                 smallvec![Statement::PendingInstruction(Box::new(
@@ -276,18 +276,16 @@ impl parser::Statement {
                 ))]
             }
             parser::Statement::PseudoInstruction(f) => match f {
-                PseudoForm::Lwi { rd, imm } => {
-                    expand_word_immediate_load(rd.to_owned(), imm.to_owned(), None)
-                        .into_iter()
-                        .map(|f| Statement::BinaryInstruction(f))
-                        .collect()
-                }
+                PseudoForm::Lwi { rd, imm } => expand_word_immediate_load(*rd, *imm, None)
+                    .into_iter()
+                    .map(|f| Statement::BinaryInstruction(f))
+                    .collect(),
                 PseudoForm::Ret => {
                     smallvec![Statement::BinaryInstruction(BinaryForm::jpr(GP_REG_LR, 0))]
                 }
             },
             parser::Statement::DataDefinition(r) => {
-                smallvec![Statement::DataDefinition(r.to_owned())]
+                smallvec![Statement::DataDefinition(r.clone())]
             }
         }
     }
@@ -304,7 +302,7 @@ fn expand_instructions(instructions: &[Spanned<parser::Statement>]) -> Vec<Spann
                 instruction
                     .expand()
                     .into_iter()
-                    .map(|i| Spanned::new(i, span.to_owned()))
+                    .map(|i| Spanned::new(i, *span))
             },
         )
         .collect()
@@ -380,7 +378,7 @@ impl LocalContext {
                 Statement::BinaryInstruction(_) => 1,
                 Statement::PendingInstruction(f) => {
                     if f.expand_again(globals, locals, current)
-                        .map_err(|e| Spanned::new(e, span.to_owned()))?
+                        .map_err(|e| Spanned::new(e, *span))?
                     {
                         resized = true;
                     }
@@ -482,7 +480,7 @@ impl GlobalContext {
                 Statement::BinaryInstruction(_) => 1,
                 Statement::PendingInstruction(f) => {
                     if f.expand_again(globals, &self.local_lom, current)
-                        .map_err(|e| Spanned::new(e, span.to_owned()))?
+                        .map_err(|e| Spanned::new(e, *span))?
                     {
                         resized = true;
                     }
@@ -496,7 +494,7 @@ impl GlobalContext {
         *offset = current;
 
         for context in &mut self.local_contexts {
-            let label = context.label.value.to_owned();
+            let label = context.label.get_ref().clone();
             self.local_lom.insert(label, *offset);
             if context.resolve_branch_relaxation_recursively(globals, &self.local_lom, offset)? {
                 resized = true;
@@ -565,7 +563,7 @@ impl SourceContext {
         let mut resized = false;
 
         for context in &mut self.global_contexts {
-            let label = context.label.value.to_owned();
+            let label = context.label.get_ref().clone();
             self.global_lom.insert(label, offset);
             if context.resolve_branch_relaxation_recursively(&self.global_lom, &mut offset)? {
                 resized = true;

@@ -1,4 +1,4 @@
-use crate::lexer::{SemanticToken, Token};
+use crate::lexer::{Semantic, Token};
 
 pub mod assembler;
 pub mod lexer;
@@ -9,7 +9,7 @@ pub mod scanner;
 pub type UnsignedStorageInteger = u64;
 pub type SignedStorageInteger = i64;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Span {
     pub offset: usize,
     pub length: usize,
@@ -20,7 +20,11 @@ impl Span {
         Self { offset, length }
     }
 
-    pub fn merge(&self, other: &Self) -> Self {
+    pub fn merge(&mut self, other: Self) {
+        self.length = other.offset - self.offset + other.length
+    }
+
+    pub fn merge_with(&self, other: Self) -> Self {
         Self {
             offset: self.offset,
             length: other.offset - self.offset + other.length,
@@ -43,12 +47,20 @@ impl<T> Spanned<T> {
         self.value
     }
 
-    pub fn inner(&self) -> &T {
+    pub fn into_parts(self) -> (T, Span) {
+        (self.value, self.span)
+    }
+
+    pub fn get_ref(&self) -> &T {
         &self.value
     }
 
-    pub fn inner_mut(&mut self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T {
         &mut self.value
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
     }
 
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Spanned<U> {
@@ -57,13 +69,23 @@ impl<T> Spanned<T> {
             span: self.span,
         }
     }
+}
 
-    pub fn merge_span<U>(&self, other: &Spanned<U>) -> Span {
-        self.span.merge(&other.span)
+impl<T> std::ops::Deref for Spanned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
-pub fn get_source_len_from_tokens(tokens: &[Spanned<SemanticToken>]) -> usize {
+impl<T> std::ops::DerefMut for Spanned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+pub fn get_source_len_from_tokens(tokens: &[Spanned<Semantic<Token>>]) -> usize {
     let num_tokens = tokens.len();
     if num_tokens == 0 {
         0
